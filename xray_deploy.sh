@@ -224,7 +224,7 @@ generate_config() {
         {"tag":"block","protocol":"blackhole"}
     ],
     "routing":{
-        "domainStrategy":"AsIs",
+        "domainStrategy":"IPIfNonMatch",
         "rules":[
             {"type":"field","inboundTag":["api-in"],"outboundTag":"api"},
             {"type":"field","outboundTag":"block","protocol":["bittorrent"]},
@@ -1016,11 +1016,17 @@ troubleshoot() {
         ERRORS=$((ERRORS + 1))
     fi
 
-    # 3. 端口监听检查
+    # 3. 端口监听检查（只检查 inbound 端口）
     echo ""
     echo -e "${GREEN}[3/8] 端口监听检查${NC}"
     if [ -f "$CONFIG_FILE" ]; then
-        PORTS=$(grep -o '"port":[0-9]*' "$CONFIG_FILE" | grep -o '[0-9]*')
+        PORTS=$(python3 -c "
+import json
+with open('$CONFIG_FILE') as f:
+    config=json.load(f)
+for inb in config.get('inbounds',[]):
+    print(inb.get('port',''))
+" 2>/dev/null)
         for PORT in $PORTS; do
             if ss -tlnp | grep -q ":${PORT} "; then
                 echo -e "  ${GREEN}✓ 端口 ${PORT} 正在监听${NC}"
@@ -1188,6 +1194,350 @@ update_xray() {
     fi
 }
 
+# ========== 监控报警 ==========
+MONITOR_CONF="/root/.xray_monitor.conf"
+MONITOR_SCRIPT="/root/.xray_monitor.sh"
+MONITOR_LOG="/var/log/xray/monitor.log"
+
+setup_mail() {
+    echo -e "${GREEN}[配置邮件通知]${NC}"
+    echo ""
+
+    # 检查并安装 msmtp
+    if ! command -v msmtp &>/dev/null; then
+        echo "正在安装邮件发送工具..."
+        if command -v apt &>/dev/null; then
+            apt update -y && apt install -y msmtp msmtp-mta
+        elif command -v yum &>/dev/null; then
+            yum install -y msmtp
+        fi
+    fi
+
+    echo -e "${CYAN}支持 Gmail / QQ邮箱 / 163邮箱 等${NC}"
+    echo ""
+    read -p "SMTP 服务器 (如 smtp.gmail.com / smtp.qq.com): " SMTP_HOST
+    read -p "SMTP 端口 (通常 587 或 465): " SMTP_PORT
+    read -p "发件邮箱: " MAIL_FROM
+    read -sp "邮箱密码/授权码: " MAIL_PASS
+    echo ""
+    read -p "收件邮箱 (报警发到哪): " MAIL_TO
+
+    # 判断 TLS 方式
+    TLS_TYPE="on"
+    TLS_STARTTLS="on"
+    if [ "$SMTP_PORT" = "465" ]; then
+        TLS_TYPE="on"
+        TLS_STARTTLS="off"
+    fi
+
+    # 写入 msmtp 配置
+    cat > /root/.msmtprc << EOF
+defaults
+auth           on
+tls            ${TLS_TYPE}
+tls_starttls   ${TLS_STARTTLS}
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+
+account        alert
+host           ${SMTP_HOST}
+port           ${SMTP_PORT}
+from           ${MAIL_FROM}
+user           ${MAIL_FROM}
+password       ${MAIL_PASS}
+
+account default : alert
+EOF
+    chmod 600 /root/.msmtprc
+
+    # 保存监控配置
+    cat > "$MONITOR_CONF" << EOF
+MAIL_TO=${MAIL_TO}
+MAIL_FROM=${MAIL_FROM}
+CHECK_INTERVAL=60
+AUTO_RESTART=yes
+EOF
+
+    # 测试发件
+    echo -e "${YELLOW}正在发送测试邮件...${NC}"
+    echo -e "Subject: Xray Monitor Test\nFrom: ${MAIL_FROM}\nTo: ${MAIL_TO}\n\nXray 监控报警测试邮件\n服务器: $(curl -s4 ip.sb 2>/dev/null)\n时间: $(date)" | msmtp "$MAIL_TO" 2>/dev/null
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✓ 测试邮件发送成功，请检查收件箱${NC}"
+    else
+        echo -e "${RED}✗ 发送失败，请检查 SMTP 配置${NC}"
+        echo -e "${YELLOW}常见问题：Gmail 需要开启应用专用密码，QQ邮箱需要授权码${NC}"
+    fi
+}
+
+install_monitor() {
+    if [ ! -f "$MONITOR_CONF" ]; then
+        echo -e "${RED}请先配置邮件通知（选 a）${NC}"
+        return
+    fi
+
+    source "$MONITOR_CONF"
+    VPS_IP=$(get_ip)
+
+    cat > "$MONITOR_SCRIPT" << 'MONEOF'
+#!/bin/bash
+CONFIG_FILE="/usr/local/etc/xray/config.json"
+MONITOR_CONF="/root/.xray_monitor.conf"
+MONITOR_LOG="/var/log/xray/monitor.log"
+ALERT_LOCK="/tmp/.xray_alert_lock"
+
+source "$MONITOR_CONF"
+VPS_IP=$(curl -s4 ip.sb 2>/dev/null || echo "unknown")
+HOSTNAME=$(hostname)
+NOW=$(date "+%Y-%m-%d %H:%M:%S")
+
+log() {
+    echo "[$NOW] $1" >> "$MONITOR_LOG"
+}
+
+send_alert() {
+    local SUBJECT="$1"
+    local BODY="$2"
+    local LOCK_KEY=$(echo "$SUBJECT" | md5sum | cut -d' ' -f1)
+    local LOCK_FILE="${ALERT_LOCK}_${LOCK_KEY}"
+
+    # 防止重复报警（同一问题30分钟内只报一次）
+    if [ -f "$LOCK_FILE" ]; then
+        local LOCK_AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
+        if [ "$LOCK_AGE" -lt 1800 ]; then
+            return
+        fi
+    fi
+
+    echo -e "Subject: [Xray Alert] ${SUBJECT}\nFrom: ${MAIL_FROM}\nTo: ${MAIL_TO}\n\n${BODY}\n\n服务器: ${VPS_IP} (${HOSTNAME})\n时间: ${NOW}" | msmtp "$MAIL_TO" 2>/dev/null
+
+    touch "$LOCK_FILE"
+    log "ALERT SENT: $SUBJECT"
+}
+
+ERRORS=0
+DETAILS=""
+
+# 1. 检查 Xray 进程
+if ! systemctl is-active --quiet xray; then
+    ERRORS=$((ERRORS + 1))
+    DETAILS="${DETAILS}\n[故障] Xray 进程已停止"
+    log "ERROR: Xray is not running"
+
+    if [ "$AUTO_RESTART" = "yes" ]; then
+        systemctl restart xray
+        sleep 3
+        if systemctl is-active --quiet xray; then
+            DETAILS="${DETAILS}\n[恢复] 已自动重启成功"
+            log "AUTO RESTART: success"
+        else
+            DETAILS="${DETAILS}\n[失败] 自动重启失败，需要手动处理"
+            log "AUTO RESTART: failed"
+        fi
+    fi
+fi
+
+# 2. 检查 SOCKS5 落地节点连通性
+if [ -f "$CONFIG_FILE" ]; then
+    python3 << PYEOF
+import json, socket, sys
+
+with open("$CONFIG_FILE", "r") as f:
+    config = json.load(f)
+
+failures = []
+for ob in config.get("outbounds", []):
+    if ob.get("protocol") == "socks":
+        servers = ob.get("settings", {}).get("servers", [])
+        tag = ob.get("tag", "unknown")
+        for s in servers:
+            addr = s["address"]
+            port = s["port"]
+            try:
+                sock = socket.create_connection((addr, port), timeout=10)
+                sock.close()
+            except Exception as e:
+                failures.append(f"{addr}:{port} [{tag}] - {e}")
+
+if failures:
+    with open("/tmp/.xray_node_failures", "w") as f:
+        for fail in failures:
+            f.write(fail + "\n")
+    sys.exit(1)
+else:
+    if __import__('os').path.exists("/tmp/.xray_node_failures"):
+        __import__('os').remove("/tmp/.xray_node_failures")
+    sys.exit(0)
+PYEOF
+
+    if [ $? -ne 0 ] && [ -f /tmp/.xray_node_failures ]; then
+        ERRORS=$((ERRORS + 1))
+        NODE_FAILURES=$(cat /tmp/.xray_node_failures)
+        DETAILS="${DETAILS}\n[故障] 落地节点不通:\n${NODE_FAILURES}"
+        log "ERROR: Node unreachable: $NODE_FAILURES"
+    fi
+fi
+
+# 3. 检查内存使用率
+MEM_PERCENT=$(free | awk '/Mem:/ {printf "%.0f", $3/$2*100}')
+if [ "$MEM_PERCENT" -gt 90 ]; then
+    ERRORS=$((ERRORS + 1))
+    DETAILS="${DETAILS}\n[警告] 内存使用率 ${MEM_PERCENT}%"
+    log "WARNING: Memory usage ${MEM_PERCENT}%"
+fi
+
+# 4. 检查磁盘使用率
+DISK_PERCENT=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
+if [ "$DISK_PERCENT" -gt 90 ]; then
+    ERRORS=$((ERRORS + 1))
+    DETAILS="${DETAILS}\n[警告] 磁盘使用率 ${DISK_PERCENT}%"
+    log "WARNING: Disk usage ${DISK_PERCENT}%"
+fi
+
+# 5. 检查端口监听（只检查 inbound 端口）
+if [ -f "$CONFIG_FILE" ]; then
+    PORTS=$(python3 -c "
+import json
+with open('$CONFIG_FILE') as f:
+    config=json.load(f)
+for inb in config.get('inbounds',[]):
+    print(inb.get('port',''))
+" 2>/dev/null)
+    for PORT in $PORTS; do
+        if ! ss -tlnp | grep -q ":${PORT} "; then
+            ERRORS=$((ERRORS + 1))
+            DETAILS="${DETAILS}\n[故障] 端口 ${PORT} 未监听"
+            log "ERROR: Port ${PORT} not listening"
+        fi
+    done
+fi
+
+# 发送报警
+if [ $ERRORS -gt 0 ]; then
+    send_alert "发现 ${ERRORS} 个问题" "$(echo -e "$DETAILS")"
+fi
+
+# 正常心跳日志
+if [ $ERRORS -eq 0 ]; then
+    log "OK: All checks passed"
+fi
+
+# 保持日志文件不超过10MB
+if [ -f "$MONITOR_LOG" ]; then
+    LOG_SIZE=$(stat -c %s "$MONITOR_LOG" 2>/dev/null || echo 0)
+    if [ "$LOG_SIZE" -gt 10485760 ]; then
+        tail -n 5000 "$MONITOR_LOG" > "${MONITOR_LOG}.tmp"
+        mv "${MONITOR_LOG}.tmp" "$MONITOR_LOG"
+    fi
+fi
+MONEOF
+
+    chmod +x "$MONITOR_SCRIPT"
+
+    # 安装 systemd 定时器（每分钟检查一次）
+    cat > /etc/systemd/system/xray-monitor.service << EOF
+[Unit]
+Description=Xray Monitor Check
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/.xray_monitor.sh
+EOF
+
+    cat > /etc/systemd/system/xray-monitor.timer << EOF
+[Unit]
+Description=Xray Monitor Timer
+
+[Timer]
+OnCalendar=*:* 
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable xray-monitor.timer
+    systemctl start xray-monitor.timer
+
+    echo -e "${GREEN}✓ 监控已启动（每分钟检查一次）${NC}"
+    echo -e "${GREEN}  检查项: Xray进程 / 节点连通 / 内存 / 磁盘 / 端口${NC}"
+    echo -e "${GREEN}  自动重启: 已开启${NC}"
+    echo -e "${GREEN}  报警邮件: ${MAIL_TO}${NC}"
+    echo -e "${GREEN}  日志文件: ${MONITOR_LOG}${NC}"
+}
+
+stop_monitor() {
+    systemctl stop xray-monitor.timer 2>/dev/null
+    systemctl disable xray-monitor.timer 2>/dev/null
+    echo -e "${GREEN}✓ 监控已停止${NC}"
+}
+
+show_monitor_log() {
+    if [ -f "$MONITOR_LOG" ]; then
+        echo -e "${GREEN}━━━ 最近50条监控日志 ━━━${NC}"
+        tail -n 50 "$MONITOR_LOG"
+    else
+        echo "暂无日志"
+    fi
+}
+
+monitor_menu() {
+    echo -e "${CYAN}╔═══════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║              监控报警管理                     ║${NC}"
+    echo -e "${CYAN}╚═══════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # 显示当前状态
+    if systemctl is-active --quiet xray-monitor.timer 2>/dev/null; then
+        echo -e "  当前状态: ${GREEN}运行中${NC}"
+    else
+        echo -e "  当前状态: ${RED}未启动${NC}"
+    fi
+    echo ""
+
+    echo "  a) 配置邮件通知"
+    echo "  b) 启动监控"
+    echo "  c) 停止监控"
+    echo "  d) 查看监控日志"
+    echo "  e) 发送测试邮件"
+    echo "  f) 返回主菜单"
+    echo ""
+    read -p "  选择: " MON_CHOICE
+
+    case $MON_CHOICE in
+        a)
+            setup_mail
+            ;;
+        b)
+            install_monitor
+            ;;
+        c)
+            stop_monitor
+            ;;
+        d)
+            show_monitor_log
+            ;;
+        e)
+            if [ -f "$MONITOR_CONF" ]; then
+                source "$MONITOR_CONF"
+                VPS_IP=$(get_ip)
+                echo -e "Subject: Xray Monitor Test\nFrom: ${MAIL_FROM}\nTo: ${MAIL_TO}\n\n测试邮件\n服务器: ${VPS_IP}\n时间: $(date)" | msmtp "$MAIL_TO" 2>/dev/null
+                if [ $? -eq 0 ]; then
+                    echo -e "${GREEN}✓ 测试邮件已发送${NC}"
+                else
+                    echo -e "${RED}✗ 发送失败${NC}"
+                fi
+            else
+                echo -e "${RED}请先配置邮件（选 a）${NC}"
+            fi
+            ;;
+        f)
+            return
+            ;;
+    esac
+}
+
 # ========== 主菜单 ==========
 main_menu() {
     print_banner
@@ -1200,10 +1550,11 @@ main_menu() {
     echo "  7) 排错诊断"
     echo "  8) 更新 Xray"
     echo "  9) 重启 Xray"
-    echo "  10) 卸载"
+    echo "  10) 监控报警"
+    echo "  11) 卸载"
     echo "  0) 退出"
     echo ""
-    read -p "请选择 [0-10]: " CHOICE
+    read -p "请选择 [0-11]: " CHOICE
 
     case $CHOICE in
         1)
@@ -1244,6 +1595,9 @@ main_menu() {
             systemctl status xray --no-pager
             ;;
         10)
+            monitor_menu
+            ;;
+        11)
             uninstall
             ;;
         0)
