@@ -229,6 +229,7 @@ collect_nodes() {
     echo -e "${GREEN}[步骤3] 添加 SOCKS5 住宅节点${NC}"
     echo -e "${CYAN}格式: IP:端口:用户名:密码${NC}"
     echo -e "${CYAN}例如: 161.77.77.5:12324:14a0f0ecfa3d6:384cafa39d${NC}"
+    echo -e "${CYAN}（如果暂无住宅节点，可直接输入 done 跳过，脚本会创建一个 443 端口的 VPS 直连节点作为起点）${NC}"
     echo ""
 
     # 节点数组内部分隔符：使用 ASCII US（Unit Separator, 0x1F），
@@ -244,7 +245,18 @@ collect_nodes() {
 
         if [ "$INPUT" = "done" ] || [ "$INPUT" = "d" ] || [ -z "$INPUT" ]; then
             if [ ${#NODES[@]} -eq 0 ]; then
-                echo -e "${RED}至少需要一个节点！${NC}"
+                # 空节点：二次确认是否创建"纯直连"起步配置
+                echo ""
+                echo -e "${YELLOW}你还没有添加任何住宅 SOCKS5 节点。${NC}"
+                echo -e "${YELLOW}是否创建一个 443 端口的 VPS 直连节点作为起点？${NC}"
+                echo -e "${CYAN}（流量将直接从 VPS 机房 IP 出口，不经过住宅 IP；之后可随时通过菜单选项 2 追加住宅节点）${NC}"
+                read -p "输入 y 创建直连起步节点 / 其他任意键继续录入住宅节点: " EMPTY_CHOICE
+                if [ "$EMPTY_CHOICE" = "y" ] || [ "$EMPTY_CHOICE" = "Y" ]; then
+                    # 哨兵格式：S_HOST=__DIRECT__ 表示这是直连节点，S_PORT/USER/PASS 留空
+                    NODES+=("443${SEP}__DIRECT__${SEP}${SEP}${SEP}${SEP}VPS-Direct")
+                    echo -e "${GREEN}  ✓ 已添加直连起步节点: VPS-Direct (监听端口: 443)${NC}"
+                    break
+                fi
                 NODE_NUM=0
                 continue
             fi
@@ -315,7 +327,6 @@ rules = [
 for idx, node in enumerate(raw_nodes, start=1):
     port, s_host, s_port, s_user, s_pass, name = node.split("\x1f", 5)
     tag_in = f"vless-in-{idx}"
-    tag_out = f"socks5-out-{idx}"
 
     inbounds.append({
         "tag": tag_in,
@@ -339,6 +350,12 @@ for idx, node in enumerate(raw_nodes, start=1):
         "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
     })
 
+    # 哨兵 __DIRECT__：这是 VPS 直连节点，不创建 socks5-out 出站，路由直接指向全局 direct
+    if s_host == "__DIRECT__":
+        rules.append({"type": "field", "inboundTag": [tag_in], "outboundTag": "direct"})
+        continue
+
+    tag_out = f"socks5-out-{idx}"
     outbounds.append({
         "tag": tag_out,
         "protocol": "socks",
@@ -480,13 +497,21 @@ print_result() {
 
         echo -e "${GREEN}━━━ ${NAME} ━━━${NC}"
         echo -e "  监听端口: ${PORT}"
-        echo -e "  落地节点: ${S_HOST}:${S_PORT}"
+        if [ "$S_HOST" = "__DIRECT__" ]; then
+            echo -e "  出口:     VPS 直连 (${VPS_IP})"
+        else
+            echo -e "  落地节点: ${S_HOST}:${S_PORT}"
+        fi
         echo -e "${YELLOW}  ${LINK}${NC}"
         echo ""
 
         echo "=== ${NAME} ===" >> "$INFO_FILE"
         echo "端口: ${PORT}" >> "$INFO_FILE"
-        echo "落地: ${S_HOST}:${S_PORT}" >> "$INFO_FILE"
+        if [ "$S_HOST" = "__DIRECT__" ]; then
+            echo "出口: VPS 直连 (${VPS_IP})" >> "$INFO_FILE"
+        else
+            echo "落地: ${S_HOST}:${S_PORT}" >> "$INFO_FILE"
+        fi
         echo "链接: ${LINK}" >> "$INFO_FILE"
         echo "" >> "$INFO_FILE"
     done
@@ -644,6 +669,132 @@ PYEOF
         echo "=== ${NODE_NAME} ===" >> "$INFO_FILE"
         echo "端口: ${NEW_PORT}" >> "$INFO_FILE"
         echo "落地: ${S_HOST}:${S_PORT}" >> "$INFO_FILE"
+        echo "链接: ${LINK}" >> "$INFO_FILE"
+    else
+        echo -e "${RED}重启失败: journalctl -u xray -n 20${NC}"
+    fi
+}
+
+# ========== 添加 VPS 直连节点（不经住宅 IP）==========
+add_direct_node() {
+    echo -e "${GREEN}[添加 VPS 直连节点]${NC}"
+    echo -e "${CYAN}此模式不经过住宅 SOCKS5，流量直接从 VPS 出口访问目标站点。${NC}"
+    echo -e "${CYAN}目标网站看到的将是你 VPS 的机房 IP。${NC}"
+    echo ""
+
+    VPS_IP=$(get_ip)
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}未找到现有配置，请先完成【全新安装】(选项 1)！${NC}"
+        return
+    fi
+
+    load_node_identity
+
+    if [ -z "$PRIVATE_KEY" ] || [ -z "$SHORT_ID" ] || [ -z "$UUID" ]; then
+        echo -e "${RED}现有配置中的业务节点密钥信息不完整，无法添加节点${NC}"
+        return
+    fi
+
+    PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
+
+    NEW_PORT=$(get_next_inbound_port)
+    if [[ "$NEW_PORT" == ERROR:* ]]; then
+        echo -e "${RED}${NEW_PORT}${NC}"
+        return
+    fi
+    while port_in_use "$NEW_PORT"; do
+        NEW_PORT=$((NEW_PORT + 1))
+        if [ "$NEW_PORT" -gt 20000 ]; then
+            echo -e "${RED}未找到可用监听端口，请手动检查端口占用${NC}"
+            return
+        fi
+    done
+
+    echo -e "新的监听端口: ${NEW_PORT}"
+
+    read -p "备注名称 (如 VPS-Direct / JP-Direct，回车默认 VPS-Direct): " NODE_NAME
+    [ -z "$NODE_NAME" ] && NODE_NAME="VPS-Direct"
+    # 清理 URL 片段里的不安全字符
+    NODE_NAME=$(echo "$NODE_NAME" | tr ' \t#?&\r\n' '-' | tr -s '-' | sed 's/^-//; s/-$//')
+    [ -z "$NODE_NAME" ] && NODE_NAME="VPS-Direct"
+
+    TAG_NUM=$(get_next_tag_num)
+
+    CONFIG_FILE="$CONFIG_FILE" \
+    TAG_NUM="$TAG_NUM" \
+    NEW_PORT="$NEW_PORT" \
+    UUID="$UUID" \
+    PRIVATE_KEY="$PRIVATE_KEY" \
+    SHORT_ID="$SHORT_ID" \
+    python3 << 'PYEOF'
+import json
+import os
+
+config_file = os.environ["CONFIG_FILE"]
+tag_num = os.environ["TAG_NUM"]
+new_port = int(os.environ["NEW_PORT"])
+uuid = os.environ["UUID"]
+private_key = os.environ["PRIVATE_KEY"]
+short_id = os.environ["SHORT_ID"]
+
+with open(config_file, "r") as f:
+    config = json.load(f)
+
+# 入站：和住宅节点同样的 VLESS+REALITY 设置，只是路由指向 direct
+config["inbounds"].append({
+    "tag": f"vless-in-{tag_num}",
+    "port": new_port,
+    "protocol": "vless",
+    "settings": {
+        "clients": [{"id": uuid, "flow": "xtls-rprx-vision"}],
+        "decryption": "none"
+    },
+    "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+            "dest": "www.microsoft.com:443",
+            "serverNames": ["www.microsoft.com"],
+            "privateKey": private_key,
+            "shortIds": [short_id]
+        },
+        "sockopt": {"tcpFastOpen": True, "tcpNoDelay": True}
+    },
+    "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
+})
+
+# 确保 direct 出站存在（全新安装一定会生成；防御性保底）
+if not any(ob.get("tag") == "direct" for ob in config.get("outbounds", [])):
+    config.setdefault("outbounds", []).append({"tag": "direct", "protocol": "freedom"})
+
+# 路由：该入站 → direct，不走任何 SOCKS5
+new_rule = {"type": "field", "inboundTag": [f"vless-in-{tag_num}"], "outboundTag": "direct"}
+config.setdefault("routing", {}).setdefault("rules", []).append(new_rule)
+
+with open(config_file, "w") as f:
+    json.dump(config, f, indent=4)
+
+print("直连节点配置已更新")
+PYEOF
+
+    apply_firewall_port "$NEW_PORT"
+
+    systemctl restart xray
+    sleep 2
+
+    if systemctl is-active --quiet xray; then
+        LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
+        echo ""
+        echo -e "${GREEN}✓ VPS 直连节点添加成功！${NC}"
+        echo -e "${GREEN}端口: ${NEW_PORT}${NC}"
+        echo -e "${GREEN}出口: VPS 直连 (${VPS_IP})${NC}"
+        echo -e "${YELLOW}${LINK}${NC}"
+
+        echo "" >> "$INFO_FILE"
+        echo "=== ${NODE_NAME} ===" >> "$INFO_FILE"
+        echo "端口: ${NEW_PORT}" >> "$INFO_FILE"
+        echo "出口: VPS 直连 (${VPS_IP})" >> "$INFO_FILE"
         echo "链接: ${LINK}" >> "$INFO_FILE"
     else
         echo -e "${RED}重启失败: journalctl -u xray -n 20${NC}"
@@ -850,6 +1001,11 @@ def get_dest(tag):
     for rule in config.get("routing", {}).get("rules", []):
         if rule.get("inboundTag") and tag in rule["inboundTag"]:
             out_tag = rule.get("outboundTag", "")
+            # 公共出站 direct/block 不挂 servers，特判一下
+            if out_tag == "direct":
+                return "VPS"
+            if out_tag == "block":
+                return "BLOCK"
             for ob in config["outbounds"]:
                 if ob.get("tag") == out_tag:
                     servers = ob.get("settings", {}).get("servers", [])
@@ -982,7 +1138,9 @@ for inb in config["inbounds"]:
             out_tag = rule.get("outboundTag")
             break
     dest = ""
-    if out_tag:
+    if out_tag == "direct":
+        dest = " → VPS 直连"
+    elif out_tag:
         for ob in config["outbounds"]:
             if ob.get("tag") == out_tag:
                 servers = ob.get("settings", {}).get("servers", [])
@@ -1075,7 +1233,9 @@ for inb in config["inbounds"]:
             out_tag = rule.get("outboundTag")
             break
     dest = ""
-    if out_tag:
+    if out_tag == "direct":
+        dest = " → VPS 直连"
+    elif out_tag:
         for ob in config["outbounds"]:
             if ob.get("tag") == out_tag:
                 servers = ob.get("settings", {}).get("servers", [])
@@ -1121,7 +1281,11 @@ if 0 <= idx < len(business_inbounds):
     config["routing"]["rules"] = new_rules
 
     if out_tag:
-        config["outbounds"] = [o for o in config["outbounds"] if o.get("tag") != out_tag]
+        # 保护公共出站：direct（VPS 直连）和 block（黑洞）是所有节点共享的，不能随节点删除
+        # 注意：本脚本假设每个业务 inbound 绑定独占的 outbound（socks5-out-N）。
+        # 若手动改过 config.json 让多个 inbound 共享同一个 socks5-out-X，此处删除会连带断开它们。
+        if out_tag not in ("direct", "block"):
+            config["outbounds"] = [o for o in config["outbounds"] if o.get("tag") != out_tag]
 
     with open(config_file, "w") as f:
         json.dump(config, f, indent=4)
@@ -1786,9 +1950,10 @@ main_menu() {
     echo "  9) 重启 Xray"
     echo "  10) 监控报警"
     echo "  11) 卸载"
+    echo "  12) 添加 VPS 直连节点 (不经住宅 IP)"
     echo "  0) 退出"
     echo ""
-    read -p "请选择 [0-11]: " CHOICE
+    read -p "请选择 [0-12]: " CHOICE
 
     case $CHOICE in
         1)
@@ -1833,6 +1998,9 @@ main_menu() {
             ;;
         11)
             uninstall
+            ;;
+        12)
+            add_direct_node
             ;;
         0)
             exit 0
