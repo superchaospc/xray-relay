@@ -45,7 +45,7 @@ get_ip() {
 
     IP=$(curl -s4 --max-time 5 ip.sb 2>/dev/null || \
          curl -s4 --max-time 5 ifconfig.me 2>/dev/null || \
-         curl -s4 --max-time 5 icanhazip.com 2>/dev/null)
+         curl -s4 --max-time 5 icanhazip.com 2>/dev/null || true)
     if [ -z "$IP" ]; then
         echo -e "${RED}无法获取本机公网 IP，请手动输入:${NC}" >&2
         read -p "VPS 公网 IP: " IP
@@ -54,6 +54,75 @@ get_ip() {
     # 写缓存
     echo "$IP" > "$IP_CACHE_FILE" 2>/dev/null
     echo "$IP"
+}
+
+# 确保 qrencode 已安装（用于生成 VLESS 链接的终端二维码）
+# 返回 0 = 可用，非 0 = 不可用（调用方应跳过二维码显示）
+ensure_qrencode() {
+    if command -v qrencode &>/dev/null; then
+        return 0
+    fi
+    echo -e "${YELLOW}首次使用二维码功能，正在安装 qrencode...${NC}" >&2
+    # 跨发行版安装：Debian/Ubuntu → apt；RHEL/AlmaLinux/Fedora → dnf；旧 CentOS → yum
+    # set -e 下所有失败分支都要显式 return，不能让非零退出码逸出
+    local rc=1
+    if command -v apt-get &>/dev/null; then
+        apt-get install -y qrencode >/dev/null 2>&1 && rc=0 || rc=1
+    elif command -v dnf &>/dev/null; then
+        dnf install -y qrencode >/dev/null 2>&1 && rc=0 || rc=1
+    elif command -v yum &>/dev/null; then
+        yum install -y qrencode >/dev/null 2>&1 && rc=0 || rc=1
+    else
+        echo -e "${RED}未检测到支持的包管理器 (apt/dnf/yum)，跳过二维码显示${NC}" >&2
+        return 1
+    fi
+    if [ "$rc" -eq 0 ]; then
+        return 0
+    else
+        echo -e "${RED}qrencode 安装失败，将跳过二维码显示（链接仍可手动复制）${NC}" >&2
+        return 1
+    fi
+}
+
+# 在终端输出 VLESS 链接的二维码，供 Shadowrocket / V2rayN / Neobox / V2rayNG 扫码导入
+# 用法: show_qrcode "<vless链接>" "<节点名(可选)>"
+show_qrcode() {
+    local link="$1"
+    local name="${2:-节点}"
+
+    [ -z "$link" ] && return 0
+    ensure_qrencode || return 0
+
+    echo ""
+    echo -e "${GREEN}┌─ 扫码导入 [${name}] ──────────────────────────${NC}"
+    echo -e "${CYAN}  Shadowrocket / V2rayN / Neobox / V2rayNG 均可扫码${NC}"
+    echo ""
+    # -t ANSIUTF8: 用半高块字符渲染，密度高、扫码友好
+    # -m 2: quiet zone 留 2 格（默认 4 格在终端里太占空间）
+    qrencode -t ANSIUTF8 -m 2 "$link" || {
+        echo -e "${RED}  二维码生成失败${NC}"
+        return 0
+    }
+    echo -e "${GREEN}└──────────────────────────────────────────────${NC}"
+    echo ""
+}
+
+# 安全地下载并执行官方 Xray 安装脚本
+# 用法: run_xray_installer install | remove
+# 先把安装脚本内容抓到本地变量再执行，避免 curl 失败触发 set -e 导致脚本直接闪退
+run_xray_installer() {
+    local action="${1:-install}"
+    echo "正在从 GitHub 下载 Xray 安装脚本..."
+    local install_script
+    install_script=$(curl -fsSL --max-time 15 \
+        https://github.com/XTLS/Xray-install/raw/main/install-release.sh 2>/dev/null || true)
+    if [ -z "$install_script" ]; then
+        echo -e "${RED}✗ 无法连接到 GitHub 下载 Xray 安装脚本${NC}"
+        echo -e "${YELLOW}  可能原因：网络不通 / GitHub 被墙 / DNS 污染${NC}"
+        echo -e "${YELLOW}  建议：检查网络、配置代理，或为本机临时配置 DNS (如 1.1.1.1 / 8.8.8.8)${NC}"
+        return 1
+    fi
+    bash -c "$install_script" @ "$action"
 }
 
 get_next_inbound_port() {
@@ -206,7 +275,10 @@ install_xray() {
         echo "Xray 已安装: $(xray version | head -1)"
     else
         echo "正在安装 Xray..."
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+        if ! run_xray_installer install; then
+            echo -e "${RED}Xray 安装失败，无法继续部署${NC}"
+            exit 1
+        fi
     fi
     mkdir -p /var/log/xray
 }
@@ -216,7 +288,7 @@ generate_keys() {
     KEY_OUTPUT=$(xray x25519)
     PRIVATE_KEY=$(echo "$KEY_OUTPUT" | grep -i "private" | awk '{print $NF}')
     PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep -i "public" | awk '{print $NF}')
-    SHORT_ID=$(openssl rand -hex 8 2>/dev/null || head -c 16 /dev/urandom | xxd -p | head -c 16)
+    SHORT_ID=$(python3 -c 'import os; print(os.urandom(8).hex())')
     UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())")
     echo -e "  Private Key: ${YELLOW}${PRIVATE_KEY}${NC}"
     echo -e "  Public Key:  ${YELLOW}${PUBLIC_KEY}${NC}"
@@ -514,6 +586,9 @@ print_result() {
         fi
         echo "链接: ${LINK}" >> "$INFO_FILE"
         echo "" >> "$INFO_FILE"
+
+        # 显示该节点的二维码，方便客户端扫码导入
+        show_qrcode "$LINK" "$NAME"
     done
 
     echo -e "${GREEN}━━━ 通用信息 ━━━${NC}"
@@ -670,6 +745,8 @@ PYEOF
         echo "端口: ${NEW_PORT}" >> "$INFO_FILE"
         echo "落地: ${S_HOST}:${S_PORT}" >> "$INFO_FILE"
         echo "链接: ${LINK}" >> "$INFO_FILE"
+
+        show_qrcode "$LINK" "$NODE_NAME"
     else
         echo -e "${RED}重启失败: journalctl -u xray -n 20${NC}"
     fi
@@ -796,6 +873,8 @@ PYEOF
         echo "端口: ${NEW_PORT}" >> "$INFO_FILE"
         echo "出口: VPS 直连 (${VPS_IP})" >> "$INFO_FILE"
         echo "链接: ${LINK}" >> "$INFO_FILE"
+
+        show_qrcode "$LINK" "$NODE_NAME"
     else
         echo -e "${RED}重启失败: journalctl -u xray -n 20${NC}"
     fi
@@ -803,10 +882,12 @@ PYEOF
 
 show_status() {
     echo -e "${GREEN}━━━ Xray 状态 ━━━${NC}"
-    systemctl status xray --no-pager -l
+    # systemctl status 在服务非 active 时返回非零，set -e 下需要兜底
+    systemctl status xray --no-pager -l || true
     echo ""
     echo -e "${GREEN}━━━ BBR 状态 ━━━${NC}"
-    sysctl net.ipv4.tcp_congestion_control
+    # 某些精简内核/首次部署前可能没有此 sysctl 键，避免触发 set -e 直接退出
+    sysctl net.ipv4.tcp_congestion_control 2>/dev/null || echo "BBR 尚未配置"
     echo ""
     echo -e "${GREEN}━━━ 节点信息 ━━━${NC}"
     if [ -f "$INFO_FILE" ]; then
@@ -1201,8 +1282,11 @@ PYEOF
         VPS_IP=$(get_ip)
         load_node_identity
         PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
+        NEW_LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Port-${NEW_PORT}"
         echo -e "${YELLOW}新链接:${NC}"
-        echo -e "vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Port-${NEW_PORT}"
+        echo -e "${NEW_LINK}"
+
+        show_qrcode "$NEW_LINK" "Port-${NEW_PORT}"
     else
         echo -e "${RED}重启失败: journalctl -u xray -n 20${NC}"
     fi
@@ -1495,8 +1579,8 @@ uninstall() {
         systemctl stop xray-monitor.timer 2>/dev/null || true
         systemctl disable xray-monitor.timer 2>/dev/null || true
 
-        # 卸载 Xray 主体
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove || true
+        # 卸载 Xray 主体（下载失败就跳过远程卸载，本地文件清理照旧继续）
+        run_xray_installer remove || echo -e "${YELLOW}⚠ 官方卸载脚本无法运行，将仅清理本地文件${NC}"
 
         # 清理监控相关 systemd 单元
         rm -f /etc/systemd/system/xray-monitor.service
@@ -1564,7 +1648,10 @@ update_xray() {
         return
     fi
 
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+    if ! run_xray_installer install; then
+        echo -e "${RED}更新中止：无法下载安装脚本，现有 Xray 保持不变${NC}"
+        return
+    fi
 
     systemctl restart xray
     sleep 2
@@ -1601,8 +1688,13 @@ setup_mail() {
         echo "正在安装邮件发送工具..."
         if command -v apt &>/dev/null; then
             apt update -y && apt install -y msmtp msmtp-mta
+        elif command -v dnf &>/dev/null; then
+            dnf install -y msmtp
         elif command -v yum &>/dev/null; then
             yum install -y msmtp
+        else
+            echo -e "${RED}未检测到支持的包管理器 (apt/dnf/yum)，请手动安装 msmtp${NC}"
+            return 1
         fi
     fi
 
