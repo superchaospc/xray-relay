@@ -66,7 +66,7 @@ chmod +x /root/xray_deploy.sh
 - **Shadowrocket (iOS)** — 首页右上角扫一扫
 - **V2rayN (Windows)** — `Ctrl+Shift+Alt+S` 从屏幕扫码，或从剪贴板导入
 - **V2rayNG (Android)** — 加号 → 扫描二维码（对着另一台屏幕）
-- **Neobox** — 导入配置 → 扫描屏幕二维码
+- **Neobox (Android)** — 导入配置 → 扫描屏幕二维码
 
 > 💡 扫码成功率与终端背景相关。白底或纯色主题最佳，避免透明/渐变背景。
 
