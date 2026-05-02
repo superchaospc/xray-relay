@@ -460,6 +460,39 @@ format_fw_status() {
     esac
 }
 
+persist_nftables_rules() {
+    local tmp_conf backup
+    tmp_conf=$(mktemp /tmp/.xray-nftables.XXXXXX.conf) || return 1
+
+    if ! nft list ruleset > "$tmp_conf" 2>/dev/null; then
+        rm -f "$tmp_conf"
+        return 1
+    fi
+
+    if ! nft -c -f "$tmp_conf" >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}⚠ 当前 nft ruleset 无法通过配置校验，跳过持久化${NC}"
+        rm -f "$tmp_conf"
+        return 1
+    fi
+
+    if [ -f /etc/nftables.conf ]; then
+        backup="/etc/nftables.conf.bak.$(date +%Y%m%d-%H%M%S)"
+        cp -a /etc/nftables.conf "$backup" 2>/dev/null || true
+        [ -n "${backup:-}" ] && echo -e "  ${CYAN}ℹ 已备份 nftables 配置: ${backup}${NC}"
+    fi
+
+    if ! mv "$tmp_conf" /etc/nftables.conf; then
+        rm -f "$tmp_conf"
+        return 1
+    fi
+    chmod 600 /etc/nftables.conf 2>/dev/null || true
+
+    if command -v systemctl &>/dev/null; then
+        systemctl enable nftables >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
 # apply_firewall_port: 在主流防火墙后端中放行指定 TCP 端口
 # 返回值：
 #   0 = 成功放行（或规则已存在）
@@ -526,14 +559,12 @@ apply_firewall_port() {
         fi
 
         if [ "$nft_added" -eq 1 ]; then
-            # 持久化（如果支持）
-            if [ -d /etc/nftables.d ] || [ -f /etc/nftables.conf ]; then
-                # 不直接覆盖用户的 nftables.conf，仅尝试常见的持久化路径
-                nft list ruleset > /etc/nftables.conf.xray.bak 2>/dev/null || true
-            fi
             echo -e "  ${GREEN}✓ 已通过 nftables 放行 ${port}/tcp${NC}"
-            echo -e "  ${YELLOW}  注意：规则未持久化，重启后可能失效${NC}"
-            echo -e "  ${YELLOW}  如需持久化，请手动追加到你的 nftables.conf 或 systemd unit${NC}"
+            if persist_nftables_rules; then
+                echo -e "  ${GREEN}✓ nftables 规则已持久化到 /etc/nftables.conf${NC}"
+            else
+                echo -e "  ${YELLOW}⚠ nftables 当前已放行，但自动持久化失败，重启后可能失效${NC}"
+            fi
             echo -e "  ${CYAN}ℹ 提醒：云厂商安全组仍需手动放行 ${port}/tcp${NC}"
             return 0
         fi

@@ -20,7 +20,7 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🎯 **固定端口映射**：每个前置节点绑定独立监听端口，客户端可精确选择出口，不做负载均衡
 - 🧩 **多节点管理**：菜单化添加、删除节点，修改端口
 - 🛟 **安全写配置**：生成临时 JSON → `xray run -test` 校验 → 备份旧配置 → 原子替换 → 启动失败自动回滚
-- 🧱 **自动防火墙放行**：依次尝试 `ufw` / `firewalld` / `nftables` / `iptables`，并对云厂商安全组给出提醒
+- 🧱 **自动防火墙放行**：依次尝试 `ufw` / `firewalld` / `nftables` / `iptables`，nftables 会自动写入 `/etc/nftables.conf` 持久化，并对云厂商安全组给出提醒
 - 🔒 **供应链保护**：默认拒绝未确认的 Xray 官方安装脚本来源，支持固定 commit 与 sha256 校验
 - ⚡ **BBR 加速**：自动开启 BBR 拥塞控制并写入内核调优参数
 - 📊 **流量统计**：基于 Xray API 的累计上行/下行流量查看
