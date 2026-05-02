@@ -368,6 +368,27 @@ validate_and_install_config() {
     return 0
 }
 
+create_config_workfile() {
+    local mode="${1:-empty}"
+    local tmp
+    if ! tmp=$(mktemp /tmp/.xray_config.new.XXXXXX.json); then
+        echo -e "${RED}✗ 无法创建临时配置文件${NC}" >&2
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+
+    if [ "$mode" = "copy" ]; then
+        if ! cp "$CONFIG_FILE" "$tmp"; then
+            echo -e "${RED}✗ 无法复制现有配置到临时文件: $tmp${NC}" >&2
+            rm -f "$tmp"
+            return 1
+        fi
+        chmod 600 "$tmp" 2>/dev/null || true
+    fi
+
+    echo "$tmp"
+}
+
 # 重启 xray 并在失败时回滚到最近备份
 restart_with_rollback() {
     systemctl restart xray
@@ -766,7 +787,11 @@ generate_config() {
     echo -e "${GREEN}[步骤4] 生成 Xray 配置文件...${NC}"
     NODES_DATA=$(printf '%s\n' "${NODES[@]}")
 
-    local NEW_CONFIG="/tmp/.xray_config.new.$$.json"
+    local NEW_CONFIG
+    if ! NEW_CONFIG=$(create_config_workfile empty); then
+        echo -e "${RED}配置生成失败，无法创建临时配置${NC}"
+        return 1
+    fi
 
     NEW_CONFIG_FILE="$NEW_CONFIG" \
     UUID="$UUID" \
@@ -1012,8 +1037,10 @@ add_node() {
 
     TAG_NUM=$(get_next_tag_num)
 
-    local NEW_CONFIG="/tmp/.xray_config.new.$$.json"
-    cp -a "$CONFIG_FILE" "$NEW_CONFIG"
+    local NEW_CONFIG
+    if ! NEW_CONFIG=$(create_config_workfile copy); then
+        return
+    fi
 
     if ! NEW_CONFIG_FILE="$NEW_CONFIG" \
         TAG_NUM="$TAG_NUM" NEW_PORT="$NEW_PORT" UUID="$UUID" \
@@ -1132,8 +1159,10 @@ add_direct_node() {
 
     TAG_NUM=$(get_next_tag_num)
 
-    local NEW_CONFIG="/tmp/.xray_config.new.$$.json"
-    cp -a "$CONFIG_FILE" "$NEW_CONFIG"
+    local NEW_CONFIG
+    if ! NEW_CONFIG=$(create_config_workfile copy); then
+        return
+    fi
 
     if ! NEW_CONFIG_FILE="$NEW_CONFIG" \
         TAG_NUM="$TAG_NUM" NEW_PORT="$NEW_PORT" UUID="$UUID" \
@@ -1521,8 +1550,10 @@ PYEOF
         echo -e "${RED}端口 ${NEW_PORT} 已被占用${NC}"; return
     fi
 
-    local NEW_CONFIG="/tmp/.xray_config.new.$$.json"
-    cp -a "$CONFIG_FILE" "$NEW_CONFIG"
+    local NEW_CONFIG
+    if ! NEW_CONFIG=$(create_config_workfile copy); then
+        return
+    fi
 
     # 关键：Python 在编号无效时退出码 2，外层捕获后 return，不再走 firewall / restart
     if ! NEW_CONFIG_FILE="$NEW_CONFIG" IDX="$IDX" NEW_PORT="$NEW_PORT" python3 << 'PYEOF'
@@ -1609,8 +1640,10 @@ PYEOF
         echo -e "${RED}输入不能为空${NC}"; return
     fi
 
-    local NEW_CONFIG="/tmp/.xray_config.new.$$.json"
-    cp -a "$CONFIG_FILE" "$NEW_CONFIG"
+    local NEW_CONFIG
+    if ! NEW_CONFIG=$(create_config_workfile copy); then
+        return
+    fi
 
     if ! NEW_CONFIG_FILE="$NEW_CONFIG" IDX="$IDX" python3 << 'PYEOF'
 import json, os, sys
