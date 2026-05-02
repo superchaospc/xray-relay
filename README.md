@@ -100,12 +100,13 @@ curl -fsSL https://raw.githubusercontent.com/superchaospc/xray-relay/main/xray_d
 ### 🛠️ 首次部署住宅 SOCKS5 中转
 
 1. 运行脚本，选择 **`1) 全新安装`**
-2. 按提示输入 SOCKS5 前置节点，推荐格式：
-   - `socks5://user:pass@host:port`
-   - 如果用户名或密码有特殊字符，请按 URL 编码，例如 `:` 写成 `%3A`，`@` 写成 `%40`
-3. 也兼容旧格式：`IP:端口:用户名:密码`
+2. 按提示输入 SOCKS5 前置节点，常见推荐格式：
+   - `IP:端口:用户名:密码`
    - 例如：`161.77.77.5:12324:user01:pass01`
-   - 旧格式中密码不能包含 `:`
+   - 这种格式中密码不能包含 `:`
+3. 如果用户名或密码有特殊字符，请使用 URL 格式：
+   - `socks5://user:pass@host:port`
+   - 特殊字符请按 URL 编码，例如 `:` 写成 `%3A`，`@` 写成 `%40`
    - 按 `done` 或直接回车结束录入
 4. 脚本会为每个节点分配独立入口端口，客户端连接不同端口即可选择不同出口
 
@@ -226,13 +227,19 @@ A: 脚本依赖 GitHub 下载官方 Xray 安装脚本，国内部分机器可能
 
 **Q: SOCKS5 密码里有 `:` 或 `|` 怎么办？**
 
-A: 推荐使用 `socks5://user:pass@host:port` 格式，并对特殊字符做 URL 编码：
+A: 大多数代理商给的是 `host:port:user:pass`，例如：
+
+```text
+161.77.48.218:12324:14aaddb22c3ae:8b9027e676
+```
+
+这种可以直接粘贴。只有当密码里有 `:`、`@`、`#` 等特殊字符时，才建议使用 `socks5://user:pass@host:port` 格式，并对特殊字符做 URL 编码：
 
 - `:` → `%3A`
 - `@` → `%40`
 - `#` → `%23`
 
-旧格式 `host:port:user:pass` 中，密码不能包含 `:`。
+常见格式 `host:port:user:pass` 中，密码不能包含 `:`。
 
 **Q: `xray run -test` 报 `Failed to get format`？**
 

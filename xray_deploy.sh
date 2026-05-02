@@ -7,7 +7,7 @@
 #    - 配置写入采用 备份 → 临时文件 → xray -test → 原子替换 → 失败回滚 流程
 #    - 编号无效等校验失败时不再触发 firewall / 重启
 #    - Xray 官方安装脚本默认 pin 到固定 commit，可通过 XRAY_INSTALL_REF 覆盖
-#    - SOCKS5 输入支持 socks5://user:pass@host:port URL 格式（密码可含 : 等特殊字符）
+#    - SOCKS5 输入支持 host:port:user:pass 常见格式，也支持 socks5:// URL 特殊字符格式
 #    - 系统升级与依赖安装拆分（默认仅装依赖，XRAY_FULL_UPGRADE=1 才整机升级）
 #    - 防火墙规则去重 + nftables 检测 + 安全组提示
 #    - 敏感文件 umask 077 + chmod 600
@@ -226,8 +226,8 @@ run_xray_installer() {
 
 # ---------- SOCKS5 输入解析 ----------
 # 接受两种格式：
-#   1. socks5://user:pass@host:port  （推荐，密码可包含特殊字符——按 RFC 3986 URL 编码）
-#   2. host:port:user:pass            （旧格式，host 可写 [::1] 表示 IPv6；密码不能含 :）
+#   1. host:port:user:pass            （常见格式，密码不能含 :）
+#   2. socks5://user:pass@host:port   （密码含特殊字符时使用，按 RFC 3986 URL 编码）
 # 解析成功后通过全局变量 PARSED_HOST / PARSED_PORT / PARSED_USER / PARSED_PASS 返回。
 # 失败时循环让用户重新输入，直到合法或 Ctrl+C。
 read_socks5() {
@@ -288,7 +288,7 @@ if m:
 
 parts = raw.split(":")
 if len(parts) != 4:
-    fail(f"旧格式必须 3 个冒号 (实际 {len(parts)-1} 个)；密码含特殊字符请改用 socks5://user:pass@host:port")
+    fail(f"常见格式必须 3 个冒号 (实际 {len(parts)-1} 个)；密码含特殊字符请改用 socks5://user:pass@host:port")
 
 ok(parts[0], parts[1], parts[2], parts[3])
 PYEOF
@@ -711,8 +711,8 @@ collect_nodes() {
     echo ""
     echo -e "${GREEN}[步骤3] 添加 SOCKS5 住宅节点${NC}"
     echo -e "${CYAN}支持两种格式：${NC}"
-    echo -e "${CYAN}  1) socks5://user:pass@host:port  (推荐，密码可含 :@/ 等特殊字符)${NC}"
-    echo -e "${CYAN}  2) host:port:user:pass            (旧格式，密码不能含 :)${NC}"
+    echo -e "${CYAN}  1) host:port:user:pass            (常见格式，推荐)${NC}"
+    echo -e "${CYAN}  2) socks5://user:pass@host:port  (密码含 :@/ 等特殊字符时使用)${NC}"
     echo -e "${CYAN}（输入 done 跳过，脚本会创建一个 443 端口的 VPS 直连节点作为起点）${NC}"
     echo ""
 
@@ -774,7 +774,7 @@ if raw.startswith(("socks5://","socks://")):
 m=re.match(r"^\[([0-9a-fA-F:]+)\]:(\d+):([^:]+):(.+)$", raw)
 if m: ok(m.group(1),m.group(2),m.group(3),m.group(4))
 parts=raw.split(":")
-if len(parts)!=4: fail(f"格式错误：旧格式需 3 个冒号 (实际 {len(parts)-1});密码含特殊字符请用 socks5:// URL")
+if len(parts)!=4: fail(f"格式错误：常见格式需 3 个冒号 (实际 {len(parts)-1});密码含特殊字符请用 socks5:// URL")
 ok(*parts)
 ' > /tmp/.xray_parse_$$ 2>&1 ); then
             echo -e "${RED}解析失败${NC}"
@@ -1187,7 +1187,7 @@ add_node() {
 
     # 严格解析 SOCKS5 输入
     PARSED_HOST="" PARSED_PORT="" PARSED_USER="" PARSED_PASS=""
-    read_socks5 "节点信息 (socks5://user:pass@host:port 或 host:port:user:pass): "
+    read_socks5 "节点信息 (host:port:user:pass 或 socks5://user:pass@host:port): "
     local S_HOST="$PARSED_HOST" S_PORT="$PARSED_PORT" S_USER="$PARSED_USER" S_PASS="$PARSED_PASS"
 
     local NODE_NAME

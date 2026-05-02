@@ -26,7 +26,7 @@ if raw.startswith(("socks5://","socks://")):
 m=re.match(r"^\[([0-9a-fA-F:]+)\]:(\d+):([^:]+):(.+)$", raw)
 if m: ok(m.group(1),m.group(2),m.group(3),m.group(4))
 parts=raw.split(":")
-if len(parts)!=4: fail(f"格式错误：旧格式需 3 个冒号 (实际 {len(parts)-1});密码含特殊字符请用 socks5:// URL")
+if len(parts)!=4: fail(f"格式错误：常见格式需 3 个冒号 (实际 {len(parts)-1});密码含特殊字符请用 socks5:// URL")
 ok(*parts)
 '''
 
@@ -37,9 +37,9 @@ def run(input_str):
     return r.stdout.strip()
 
 cases = [
-    # 旧格式正常
+    # 常见格式正常
     ("161.77.77.5:12324:14a0f0ecfa3d6:384cafa39d", "OK"),
-    # 旧格式密码含 : -> 应该报错让用户改 URL
+    # 常见格式密码含 : -> 应该报错让用户改 URL
     ("1.2.3.4:1080:user:pass:with:colon", "ERR"),
     # URL 格式密码含 :@/ 都 OK（要先 URL 编码）
     ("socks5://user:pa%3Ass%40word@1.2.3.4:1080", "OK"),
