@@ -995,6 +995,136 @@ print_result() {
     fi
 }
 
+refresh_info_file_from_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        return 1
+    fi
+
+    if ! CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
+import json
+import os
+import sys
+
+with open(os.environ["CONFIG_FILE"]) as f:
+    config = json.load(f)
+
+has_business = any(inb.get("tag") != "api-in" for inb in config.get("inbounds", []))
+sys.exit(0 if has_business else 1)
+PYEOF
+    then
+        : > "$INFO_FILE"
+        chmod 600 "$INFO_FILE" 2>/dev/null || true
+        return 0
+    fi
+
+    local VPS_IP PUBLIC_KEY
+    VPS_IP=$(get_ip)
+    load_node_identity
+    if [ -z "$UUID" ] || [ -z "$PRIVATE_KEY" ] || [ -z "$SHORT_ID" ]; then
+        echo -e "${YELLOW}⚠ 无法从现有配置读取节点身份，跳过刷新 ${INFO_FILE}${NC}"
+        return 1
+    fi
+    PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
+    if [ -z "$PUBLIC_KEY" ]; then
+        echo -e "${YELLOW}⚠ 无法派生 public key，跳过刷新 ${INFO_FILE}${NC}"
+        return 1
+    fi
+
+    CONFIG_FILE="$CONFIG_FILE" \
+    INFO_FILE="$INFO_FILE" \
+    VPS_IP="$VPS_IP" \
+    UUID="$UUID" \
+    PUBLIC_KEY="$PUBLIC_KEY" \
+    SHORT_ID="$SHORT_ID" \
+    CLIENT_FP="$CLIENT_FP" \
+    REFRESH_NAME_PORT="${REFRESH_NAME_PORT:-}" \
+    REFRESH_NAME="${REFRESH_NAME:-}" \
+    python3 << 'PYEOF'
+import json
+import os
+import re
+
+config_file = os.environ["CONFIG_FILE"]
+info_file = os.environ["INFO_FILE"]
+vps_ip = os.environ["VPS_IP"]
+uuid = os.environ["UUID"]
+public_key = os.environ["PUBLIC_KEY"]
+short_id = os.environ["SHORT_ID"]
+client_fp = os.environ["CLIENT_FP"]
+
+old_names = {}
+if os.path.exists(info_file):
+    current_name = None
+    with open(info_file, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            line = raw.strip()
+            m = re.fullmatch(r"===\s*(.*?)\s*===", line)
+            if m:
+                current_name = m.group(1).strip() or None
+                continue
+            m = re.fullmatch(r"端口:\s*(\d+)", line)
+            if m and current_name:
+                old_names[int(m.group(1))] = current_name
+
+override_port = os.environ.get("REFRESH_NAME_PORT", "")
+override_name = os.environ.get("REFRESH_NAME", "")
+if override_port and override_name:
+    try:
+        old_names[int(override_port)] = override_name
+    except ValueError:
+        pass
+
+with open(config_file) as f:
+    config = json.load(f)
+
+outbounds = {ob.get("tag"): ob for ob in config.get("outbounds", [])}
+route_by_inbound = {}
+for rule in config.get("routing", {}).get("rules", []):
+    out_tag = rule.get("outboundTag")
+    for tag in rule.get("inboundTag", []) or []:
+        route_by_inbound[tag] = out_tag
+
+lines = []
+for inb in config.get("inbounds", []):
+    tag = inb.get("tag", "")
+    if tag == "api-in":
+        continue
+    port = inb.get("port")
+    if not isinstance(port, int):
+        continue
+
+    out_tag = route_by_inbound.get(tag, "")
+    ob = outbounds.get(out_tag, {})
+    name = old_names.get(port)
+    if not name:
+        name = "VPS-Direct" if out_tag == "direct" else f"Port-{port}"
+    safe_name = re.sub(r"[\s#?&\r\n\t]+", "-", name).strip("-") or f"Port-{port}"
+
+    if out_tag == "direct":
+        dest_line = f"出口: VPS 直连 ({vps_ip})"
+    else:
+        servers = ob.get("settings", {}).get("servers", [])
+        if servers:
+            dest_line = f"落地: {servers[0].get('address', '?')}:{servers[0].get('port', '?')}"
+        else:
+            dest_line = f"出口: {out_tag or 'unknown'}"
+
+    link = (
+        f"vless://{uuid}@{vps_ip}:{port}"
+        f"?encryption=none&flow=xtls-rprx-vision&security=reality"
+        f"&sni=www.microsoft.com&fp={client_fp}&pbk={public_key}"
+        f"&sid={short_id}&type=tcp#{safe_name}"
+    )
+    lines.extend([f"=== {safe_name} ===", f"端口: {port}", dest_line, f"链接: {link}", ""])
+
+with open(info_file, "w") as f:
+    f.write("\n".join(lines))
+    if lines:
+        f.write("\n")
+PYEOF
+    chmod 600 "$INFO_FILE" 2>/dev/null || true
+}
+
 # ========== 添加节点（住宅 SOCKS5）==========
 add_node() {
     echo -e "${GREEN}[添加节点模式]${NC}"
@@ -1113,14 +1243,7 @@ PYEOF
         echo -e "${GREEN}落地: ${S_HOST}:${S_PORT}${NC}"
         echo -e "  $(format_fw_status)"
         echo -e "${YELLOW}${LINK}${NC}"
-        {
-            echo ""
-            echo "=== ${NODE_NAME} ==="
-            echo "端口: ${NEW_PORT}"
-            echo "落地: ${S_HOST}:${S_PORT}"
-            echo "链接: ${LINK}"
-        } >> "$INFO_FILE"
-        chmod 600 "$INFO_FILE"
+        REFRESH_NAME_PORT="$NEW_PORT" REFRESH_NAME="$NODE_NAME" refresh_info_file_from_config || true
         show_qrcode "$LINK" "$NODE_NAME"
     fi
 }
@@ -1216,14 +1339,7 @@ PYEOF
         echo -e "${GREEN}出口: VPS 直连 (${VPS_IP})${NC}"
         echo -e "  $(format_fw_status)"
         echo -e "${YELLOW}${LINK}${NC}"
-        {
-            echo ""
-            echo "=== ${NODE_NAME} ==="
-            echo "端口: ${NEW_PORT}"
-            echo "出口: VPS 直连 (${VPS_IP})"
-            echo "链接: ${LINK}"
-        } >> "$INFO_FILE"
-        chmod 600 "$INFO_FILE"
+        REFRESH_NAME_PORT="$NEW_PORT" REFRESH_NAME="$NODE_NAME" refresh_info_file_from_config || true
         show_qrcode "$LINK" "$NODE_NAME"
     fi
 }
@@ -1236,7 +1352,12 @@ show_status() {
     sysctl net.ipv4.tcp_congestion_control 2>/dev/null || echo "BBR 尚未配置"
     echo ""
     echo -e "${GREEN}━━━ 节点信息 ━━━${NC}"
+    refresh_info_file_from_config || true
     if [ ! -f "$INFO_FILE" ]; then
+        echo "暂无节点信息"
+        return
+    fi
+    if [ ! -s "$INFO_FILE" ]; then
         echo "暂无节点信息"
         return
     fi
@@ -1598,6 +1719,7 @@ PYEOF
         PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
         NEW_LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Port-${NEW_PORT}"
         echo -e "${YELLOW}新链接:${NC} ${NEW_LINK}"
+        refresh_info_file_from_config || true
         show_qrcode "$NEW_LINK" "Port-${NEW_PORT}"
     fi
 }
@@ -1691,6 +1813,7 @@ PYEOF
     fi
 
     if restart_with_rollback; then
+        refresh_info_file_from_config || true
         echo -e "${GREEN}✓ 节点已删除${NC}"
     fi
 }
