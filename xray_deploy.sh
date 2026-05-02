@@ -2,9 +2,21 @@
 # =====================================================
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
+#
+#  v2.1 改进点（基于 code review）：
+#    - 配置写入采用 备份 → 临时文件 → xray -test → 原子替换 → 失败回滚 流程
+#    - 编号无效等校验失败时不再触发 firewall / 重启
+#    - Xray 官方安装脚本默认 pin 到固定 commit，可通过 XRAY_INSTALL_REF 覆盖
+#    - SOCKS5 输入支持 socks5://user:pass@host:port URL 格式（密码可含 : 等特殊字符）
+#    - 系统升级与依赖安装拆分（默认仅装依赖，XRAY_FULL_UPGRADE=1 才整机升级）
+#    - 防火墙规则去重 + nftables 检测 + 安全组提示
+#    - 敏感文件 umask 077 + chmod 600
+#    - root / systemd / 443 占用预检
+#    - SMTP 配置改用 Python 安全写入，避免特殊字符破坏文件
 # =====================================================
 
 set -e
+umask 077
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -13,29 +25,63 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 CONFIG_FILE="/usr/local/etc/xray/config.json"
+CONFIG_DIR="$(dirname "$CONFIG_FILE")"
+CONFIG_BACKUP_KEEP=5
 INFO_FILE="/root/xray_nodes_info.txt"
 SYSCTL_FILE="/etc/sysctl.d/99-xray.conf"
-# 客户端指纹（可选：chrome / firefox / safari / ios / android / edge / random）
+IP_CACHE_FILE="/root/.xray_vps_ip"
+# 客户端指纹（chrome / firefox / safari / ios / android / edge / random）
 CLIENT_FP="${CLIENT_FP:-chrome}"
+#
+# === Xray 官方安装脚本来源（供应链安全） ===
+#
+# 默认值故意设成 PIN_ME，脚本启动时会拒绝继续，强迫你做选择：
+#   选项 A（推荐，生产）：把 XRAY_INSTALL_REF_DEFAULT 改成你审计过的具体 commit SHA：
+#     XRAY_INSTALL_REF_DEFAULT="2f37cdc7a76ab8d6a5e3a7f0e5d2cafe..."
+#     可选附加 sha256 校验：
+#     XRAY_INSTALL_SHA256_DEFAULT="<sha256 of install-release.sh at that commit>"
+#     拿到方法：
+#       git ls-remote https://github.com/XTLS/Xray-install.git refs/heads/main
+#       curl -L https://raw.githubusercontent.com/XTLS/Xray-install/<COMMIT>/install-release.sh \
+#         | sha256sum
+#   选项 B（一次性，逃生）：环境变量临时用 main 分支
+#     XRAY_INSTALL_REF=main bash xray_deploy.sh
+XRAY_INSTALL_REF_DEFAULT="PIN_ME"
+XRAY_INSTALL_SHA256_DEFAULT=""
+XRAY_INSTALL_REF="${XRAY_INSTALL_REF:-$XRAY_INSTALL_REF_DEFAULT}"
+XRAY_INSTALL_SHA256="${XRAY_INSTALL_SHA256:-$XRAY_INSTALL_SHA256_DEFAULT}"
+# 是否在敏感输出中隐藏 UUID/密码片段（设 1 启用）
+XRAY_REDACT="${XRAY_REDACT:-0}"
+
+# qrencode 安装状态缓存：0=可用 1=不可用 unset=未尝试
+_QRENCODE_CHECKED=""
 
 # ========== 工具函数 ==========
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.0       ║"
-    echo "║   支持多节点 · 一键部署 · 自动优化           ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.1       ║"
+    echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
 
-IP_CACHE_FILE="/root/.xray_vps_ip"
+redact() {
+    # 隐藏中间字符，仅保留首 4 末 4
+    local s="$1"
+    if [ "$XRAY_REDACT" != "1" ] || [ ${#s} -lt 12 ]; then
+        echo "$s"
+        return
+    fi
+    echo "${s:0:4}…${s: -4}"
+}
 
 get_ip() {
-    # 优先读缓存（24 小时内有效）
     if [ -f "$IP_CACHE_FILE" ]; then
         local cache_age=$(( $(date +%s) - $(stat -c %Y "$IP_CACHE_FILE" 2>/dev/null || echo 0) ))
         if [ "$cache_age" -lt 86400 ]; then
-            local cached_ip=$(cat "$IP_CACHE_FILE" 2>/dev/null)
+            local cached_ip
+            cached_ip=$(cat "$IP_CACHE_FILE" 2>/dev/null)
             if [ -n "$cached_ip" ]; then
                 echo "$cached_ip"
                 return
@@ -43,28 +89,29 @@ get_ip() {
         fi
     fi
 
+    local IP
     IP=$(curl -s4 --max-time 5 ip.sb 2>/dev/null || \
          curl -s4 --max-time 5 ifconfig.me 2>/dev/null || \
          curl -s4 --max-time 5 icanhazip.com 2>/dev/null || true)
     if [ -z "$IP" ]; then
         echo -e "${RED}无法获取本机公网 IP，请手动输入:${NC}" >&2
-        read -p "VPS 公网 IP: " IP
+        read -rp "VPS 公网 IP: " IP
     fi
 
-    # 写缓存
-    echo "$IP" > "$IP_CACHE_FILE" 2>/dev/null
+    echo "$IP" > "$IP_CACHE_FILE" 2>/dev/null || true
+    chmod 600 "$IP_CACHE_FILE" 2>/dev/null || true
     echo "$IP"
 }
 
-# 确保 qrencode 已安装（用于生成 VLESS 链接的终端二维码）
-# 返回 0 = 可用，非 0 = 不可用（调用方应跳过二维码显示）
 ensure_qrencode() {
+    if [ "$_QRENCODE_CHECKED" = "0" ]; then return 0; fi
+    if [ "$_QRENCODE_CHECKED" = "1" ]; then return 1; fi
+
     if command -v qrencode &>/dev/null; then
+        _QRENCODE_CHECKED=0
         return 0
     fi
     echo -e "${YELLOW}首次使用二维码功能，正在安装 qrencode...${NC}" >&2
-    # 跨发行版安装：Debian/Ubuntu → apt；RHEL/AlmaLinux/Fedora → dnf；旧 CentOS → yum
-    # set -e 下所有失败分支都要显式 return，不能让非零退出码逸出
     local rc=1
     if command -v apt-get &>/dev/null; then
         apt-get install -y qrencode >/dev/null 2>&1 && rc=0 || rc=1
@@ -74,22 +121,21 @@ ensure_qrencode() {
         yum install -y qrencode >/dev/null 2>&1 && rc=0 || rc=1
     else
         echo -e "${RED}未检测到支持的包管理器 (apt/dnf/yum)，跳过二维码显示${NC}" >&2
+        _QRENCODE_CHECKED=1
         return 1
     fi
     if [ "$rc" -eq 0 ]; then
+        _QRENCODE_CHECKED=0
         return 0
-    else
-        echo -e "${RED}qrencode 安装失败，将跳过二维码显示（链接仍可手动复制）${NC}" >&2
-        return 1
     fi
+    echo -e "${RED}qrencode 安装失败，将跳过二维码显示（链接仍可手动复制）${NC}" >&2
+    _QRENCODE_CHECKED=1
+    return 1
 }
 
-# 在终端输出 VLESS 链接的二维码，供 Shadowrocket / V2rayN / Neobox / V2rayNG 扫码导入
-# 用法: show_qrcode "<vless链接>" "<节点名(可选)>"
 show_qrcode() {
     local link="$1"
     local name="${2:-节点}"
-
     [ -z "$link" ] && return 0
     ensure_qrencode || return 0
 
@@ -97,8 +143,6 @@ show_qrcode() {
     echo -e "${GREEN}┌─ 扫码导入 [${name}] ──────────────────────────${NC}"
     echo -e "${CYAN}  Shadowrocket / V2rayN / Neobox / V2rayNG 均可扫码${NC}"
     echo ""
-    # -t ANSIUTF8: 用半高块字符渲染，密度高、扫码友好
-    # -m 2: quiet zone 留 2 格（默认 4 格在终端里太占空间）
     qrencode -t ANSIUTF8 -m 2 "$link" || {
         echo -e "${RED}  二维码生成失败${NC}"
         return 0
@@ -107,49 +151,265 @@ show_qrcode() {
     echo ""
 }
 
-# 安全地下载并执行官方 Xray 安装脚本
+# ---------- 远程 Xray 安装脚本（pin 到固定 ref + 下载到文件后执行） ----------
 # 用法: run_xray_installer install | remove
-# 先把安装脚本内容抓到本地变量再执行，避免 curl 失败触发 set -e 导致脚本直接闪退
 run_xray_installer() {
     local action="${1:-install}"
-    echo "正在从 GitHub 下载 Xray 安装脚本..."
-    local install_script
-    install_script=$(curl -fsSL --max-time 15 \
-        https://github.com/XTLS/Xray-install/raw/main/install-release.sh 2>/dev/null || true)
-    if [ -z "$install_script" ]; then
-        echo -e "${RED}✗ 无法连接到 GitHub 下载 Xray 安装脚本${NC}"
-        echo -e "${YELLOW}  可能原因：网络不通 / GitHub 被墙 / DNS 污染${NC}"
-        echo -e "${YELLOW}  建议：检查网络、配置代理，或为本机临时配置 DNS (如 1.1.1.1 / 8.8.8.8)${NC}"
+    local ref="$XRAY_INSTALL_REF"
+    local expected_sha="$XRAY_INSTALL_SHA256"
+
+    # 拒绝 PIN_ME 占位符——强迫用户做出选择
+    if [ "$ref" = "PIN_ME" ] || [ -z "$ref" ]; then
+        echo -e "${RED}✗ Xray 安装脚本来源未配置${NC}"
+        echo -e "${YELLOW}  需要选择以下之一才能继续：${NC}"
+        echo -e "${YELLOW}    1) 编辑脚本顶部，把 XRAY_INSTALL_REF_DEFAULT 改成具体 commit SHA${NC}"
+        echo -e "${YELLOW}       (推荐附加 XRAY_INSTALL_SHA256_DEFAULT 校验)${NC}"
+        echo -e "${YELLOW}    2) 临时一次性使用 main 分支：${NC}"
+        echo -e "${YELLOW}       XRAY_INSTALL_REF=main bash xray_deploy.sh${NC}"
+        echo -e "${YELLOW}  查询当前 main 的 commit SHA：${NC}"
+        echo -e "${YELLOW}    git ls-remote https://github.com/XTLS/Xray-install.git refs/heads/main${NC}"
         return 1
     fi
-    bash -c "$install_script" @ "$action"
+
+    local url="https://raw.githubusercontent.com/XTLS/Xray-install/${ref}/install-release.sh"
+    echo "正在下载 Xray 安装脚本 (ref=${ref})..."
+    if [ "$ref" = "main" ]; then
+        echo -e "${YELLOW}⚠ 当前使用 main 分支（追新，无哈希校验）。${NC}"
+        echo -e "${YELLOW}  生产环境强烈建议改用具体 commit SHA + sha256。${NC}"
+    fi
+
+    local tmp_script
+    tmp_script=$(mktemp /tmp/xray-install.XXXXXX.sh)
+    chmod 600 "$tmp_script"
+    # shellcheck disable=SC2064  # 我们要的就是当前 tmp_script 路径展开
+    trap "rm -f '$tmp_script'" RETURN
+
+    if ! curl -fsSL --max-time 30 "$url" -o "$tmp_script" 2>/dev/null; then
+        echo -e "${RED}✗ 无法下载 Xray 安装脚本${NC}"
+        echo -e "${YELLOW}  URL: $url${NC}"
+        echo -e "${YELLOW}  可能原因：网络不通 / GitHub 被墙 / DNS 污染 / commit 不存在${NC}"
+        return 1
+    fi
+
+    # 简单 sanity check：必须以 #! 开头且包含 install-release 的特征字符串
+    if ! head -1 "$tmp_script" | grep -q '^#!'; then
+        echo -e "${RED}✗ 下载内容不是有效 shell 脚本（可能是错误页）${NC}"
+        return 1
+    fi
+    if ! grep -q "Xray" "$tmp_script"; then
+        echo -e "${RED}✗ 下载内容缺少 Xray 关键字，疑似被劫持${NC}"
+        return 1
+    fi
+
+    # sha256 校验（如果配了 expected_sha）
+    if [ -n "$expected_sha" ]; then
+        local actual_sha
+        actual_sha=$(sha256sum "$tmp_script" | awk '{print $1}')
+        if [ "$actual_sha" != "$expected_sha" ]; then
+            echo -e "${RED}✗ sha256 校验失败！${NC}"
+            echo -e "${YELLOW}  预期: $expected_sha${NC}"
+            echo -e "${YELLOW}  实际: $actual_sha${NC}"
+            echo -e "${YELLOW}  上游可能强制推送了 commit，或者下载内容被劫持。${NC}"
+            return 1
+        fi
+        echo -e "  ${GREEN}✓ sha256 校验通过${NC}"
+    elif [ "$ref" != "main" ]; then
+        # 用了固定 commit 但没配 sha256：给一个温和提示
+        local actual_sha
+        actual_sha=$(sha256sum "$tmp_script" | awk '{print $1}')
+        echo -e "  ${CYAN}ℹ 当前下载的 sha256: $actual_sha${NC}"
+        echo -e "  ${CYAN}  建议把这个值写进 XRAY_INSTALL_SHA256_DEFAULT 以启用校验${NC}"
+    fi
+
+    bash "$tmp_script" "$action"
+}
+
+# ---------- SOCKS5 输入解析 ----------
+# 接受两种格式：
+#   1. socks5://user:pass@host:port  （推荐，密码可包含特殊字符——按 RFC 3986 URL 编码）
+#   2. host:port:user:pass            （旧格式，host 可写 [::1] 表示 IPv6；密码不能含 :）
+# 解析成功后通过全局变量 PARSED_HOST / PARSED_PORT / PARSED_USER / PARSED_PASS 返回。
+# 失败时循环让用户重新输入，直到合法或 Ctrl+C。
+read_socks5() {
+    # 把 prompt 文案传进来；返回值通过全局变量
+    local prompt="$1"
+    local raw out
+    while true; do
+        read -rp "$prompt" raw
+        if [ -z "$raw" ]; then
+            echo -e "${RED}输入不能为空${NC}"
+            continue
+        fi
+        out=$(INPUT="$raw" python3 - <<'PYEOF' 2>&1
+import os, sys, re
+from urllib.parse import urlsplit, unquote
+
+raw = os.environ["INPUT"].strip()
+
+def fail(msg):
+    print(f"ERR\t{msg}")
+    sys.exit(0)
+
+def ok(host, port, user, pwd):
+    try:
+        p = int(port)
+    except (TypeError, ValueError):
+        fail(f"端口必须是数字: {port}")
+    if not (1 <= p <= 65535):
+        fail(f"端口超出范围 1-65535: {p}")
+    if not host:
+        fail("host 为空")
+    if not user:
+        fail("用户名为空")
+    if pwd is None or pwd == "":
+        fail("密码为空")
+    # 用 \x1f 分隔，避免 host/user/pwd 含 \t 或换行
+    print("OK\t" + "\x1f".join([host, str(p), user, pwd]))
+    sys.exit(0)
+
+if raw.startswith(("socks5://", "socks://")):
+    try:
+        u = urlsplit(raw)
+        # 关键：urlsplit 本身不会抛，但 u.port getter 在端口非数字/越界时抛 ValueError
+        # 必须把 hostname / port 的访问也包进同一个 try
+        host = u.hostname
+        port = u.port
+        username = u.username
+        password = u.password
+    except (ValueError, Exception) as e:
+        fail(f"URL 解析失败: {e}")
+    if not host or not port:
+        fail("URL 缺少 host 或 port")
+    ok(host, port, unquote(username or ""), unquote(password or ""))
+
+m = re.match(r"^\[([0-9a-fA-F:]+)\]:(\d+):([^:]+):(.+)$", raw)
+if m:
+    ok(m.group(1), m.group(2), m.group(3), m.group(4))
+
+parts = raw.split(":")
+if len(parts) != 4:
+    fail(f"旧格式必须 3 个冒号 (实际 {len(parts)-1} 个)；密码含特殊字符请改用 socks5://user:pass@host:port")
+
+ok(parts[0], parts[1], parts[2], parts[3])
+PYEOF
+)
+        if [[ "$out" == OK* ]]; then
+            local payload="${out#OK	}"
+            IFS=$'\x1f' read -r PARSED_HOST PARSED_PORT PARSED_USER PARSED_PASS <<< "$payload"
+            return 0
+        else
+            echo -e "${RED}格式错误: ${out#ERR	}${NC}"
+            echo -e "${CYAN}请重新输入，或按 Ctrl+C 退出${NC}"
+        fi
+    done
+}
+
+# ---------- 配置原子写入 ----------
+# 用法: safe_write_config "<生成新配置的 python 命令名>" -- [可选环境变量传递]
+# 该函数负责：
+#   1. 备份原配置
+#   2. 在 /tmp 生成新配置
+#   3. xray run -test 校验
+#   4. 原子 mv 替换
+# 调用方只需提供一个把 NEW_CONFIG_FILE 路径读取并输出到该路径的 python 闭包
+# 这里采用更直接的契约：调用方先把新配置写到 $1（临时文件），本函数负责其后的校验/替换
+validate_and_install_config() {
+    local new_config="$1"
+    if [ ! -s "$new_config" ]; then
+        echo -e "${RED}✗ 新配置文件为空: $new_config${NC}"
+        rm -f "$new_config"
+        return 1
+    fi
+
+    # JSON 合法性
+    if ! python3 -c "import json,sys; json.load(open('$new_config'))" 2>/dev/null; then
+        echo -e "${RED}✗ 新配置不是合法 JSON${NC}"
+        rm -f "$new_config"
+        return 1
+    fi
+
+    # xray -test
+    if command -v xray &>/dev/null; then
+        if ! xray run -test -config "$new_config" >/tmp/.xray-test.log 2>&1; then
+            echo -e "${RED}✗ xray 配置测试失败：${NC}"
+            sed 's/^/    /' /tmp/.xray-test.log
+            rm -f "$new_config" /tmp/.xray-test.log
+            return 1
+        fi
+        rm -f /tmp/.xray-test.log
+    else
+        echo -e "${YELLOW}⚠ xray 二进制尚未安装，跳过 -test 校验${NC}"
+    fi
+
+    # 继承现有配置的 owner/group；xray.service 可能以 nobody 运行，root:root 600 会导致 permission denied
+    local config_owner_group="root:root"
+    if [ -f "$CONFIG_FILE" ]; then
+        config_owner_group=$(stat -c "%U:%G" "$CONFIG_FILE" 2>/dev/null || echo "root:root")
+    elif id nobody >/dev/null 2>&1; then
+        config_owner_group="nobody:nogroup"
+    fi
+
+    # 备份原配置
+    if [ -f "$CONFIG_FILE" ]; then
+        local ts backup
+        ts=$(date +%Y%m%d-%H%M%S)
+        backup="${CONFIG_FILE}.bak.${ts}"
+        cp -a "$CONFIG_FILE" "$backup"
+        chmod 600 "$backup"
+        # 仅保留最近 N 份
+        ls -1t "${CONFIG_FILE}.bak."* 2>/dev/null | tail -n +"$((CONFIG_BACKUP_KEEP+1))" | xargs -r rm -f
+        echo -e "  ✓ 已备份原配置: $backup"
+    fi
+
+    # 原子替换
+    mv "$new_config" "$CONFIG_FILE"
+    chown "$config_owner_group" "$CONFIG_FILE" 2>/dev/null || true
+    chmod 600 "$CONFIG_FILE"
+    return 0
+}
+
+# 重启 xray 并在失败时回滚到最近备份
+restart_with_rollback() {
+    systemctl restart xray
+    sleep 2
+    if systemctl is-active --quiet xray; then
+        return 0
+    fi
+
+    echo -e "${RED}✗ Xray 重启失败，准备回滚...${NC}"
+    local last_backup
+    last_backup=$(ls -1t "${CONFIG_FILE}.bak."* 2>/dev/null | head -1)
+    if [ -z "$last_backup" ]; then
+        echo -e "${RED}✗ 找不到任何备份文件，无法自动回滚${NC}"
+        echo -e "${YELLOW}  请手动检查: journalctl -u xray -n 30${NC}"
+        return 1
+    fi
+
+    cp -a "$last_backup" "$CONFIG_FILE"
+    systemctl restart xray
+    sleep 2
+    if systemctl is-active --quiet xray; then
+        echo -e "${GREEN}✓ 已回滚到 $last_backup，Xray 恢复运行${NC}"
+        return 1   # 业务上仍然算"操作失败"
+    fi
+
+    echo -e "${RED}✗ 回滚后 Xray 仍未启动，请手动排查${NC}"
+    echo -e "${YELLOW}  备份位置: $last_backup${NC}"
+    return 1
 }
 
 get_next_inbound_port() {
     python3 << 'PYEOF'
 import json, sys
-
 config_file = "/usr/local/etc/xray/config.json"
-
-with open(config_file, "r") as f:
+with open(config_file) as f:
     config = json.load(f)
-
-used = {
-    inb.get("port", 0)
-    for inb in config.get("inbounds", [])
-    if inb.get("tag") != "api-in"
-}
-
-# 从 8443 开始找第一个没被配置占用的端口（与历史 max 无关，
-# 避免 change_port 把端口改到 19999 之后再添加节点就溢出的 bug）
+used = {inb.get("port", 0) for inb in config.get("inbounds", []) if inb.get("tag") != "api-in"}
 candidate = 8443
 while candidate in used:
     candidate += 1
     if candidate > 20000:
-        # 用正常退出码 + 字符串前缀，避免 set -e 下外层命令替换瞬间崩溃
-        print("ERROR: next inbound port exceeds 20000")
-        sys.exit(0)
-
+        print("ERROR: next inbound port exceeds 20000"); sys.exit(0)
 print(candidate)
 PYEOF
 }
@@ -159,47 +419,151 @@ port_in_use() {
     ss -tln 2>/dev/null | grep -q ":${port} "
 }
 
+# apply_firewall_port_capture: 调用 apply_firewall_port 并把返回码塞到全局变量 LAST_FW_RC。
+# 这样 set -e 下不会因为防火墙失败退出，调用方又能拿到状态做后续提示。
+# 用法：apply_firewall_port_capture "$NEW_PORT"
+apply_firewall_port_capture() {
+    LAST_FW_RC=0
+    apply_firewall_port "$1" || LAST_FW_RC=$?
+    return 0
+}
+
+# format_fw_status: 根据 LAST_FW_RC 输出一行可附加在"节点添加成功"等消息后的状态提示
+# 不输出任何内容时返回 0；调用方可以直接 echo "$(format_fw_status)"
+format_fw_status() {
+    case "${LAST_FW_RC:-0}" in
+        0)  echo -e "${GREEN}防火墙: 已放行 ✓${NC}" ;;
+        2)  echo -e "${YELLOW}防火墙: 未检测到后端，请确认默认策略允许该端口${NC}" ;;
+        3)  echo -e "${RED}⚠ 防火墙放行失败！外部连接可能不通，请按上方提示手动处理${NC}" ;;
+        *)  echo -e "${YELLOW}防火墙: 未知状态 (rc=${LAST_FW_RC})${NC}" ;;
+    esac
+}
+
+# apply_firewall_port: 在主流防火墙后端中放行指定 TCP 端口
+# 返回值：
+#   0 = 成功放行（或规则已存在）
+#   2 = 没找到任何已激活的防火墙后端 / 默认策略疑似 ACCEPT，可能不需要放行
+#   3 = 检测到 nftables 但自动放行失败，外部连接很可能被丢弃
 apply_firewall_port() {
     local port="$1"
 
-    # 优先级 1: UFW (Debian/Ubuntu)
+    # UFW
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "$port" >/dev/null 2>&1 || true
-        return
+        if ufw allow "$port" >/dev/null 2>&1; then
+            echo -e "  ${CYAN}ℹ 提醒：云厂商安全组仍需手动放行 ${port}/tcp${NC}"
+            return 0
+        fi
+        echo -e "  ${RED}✗ ufw 处于 active 但放行端口 ${port} 失败${NC}"
+        echo -e "  ${YELLOW}  请手动执行: ufw allow ${port}/tcp${NC}"
+        echo -e "  ${YELLOW}  常见原因: 配置异常、规则上限、ufw 二进制损坏${NC}"
+        return 3
     fi
 
-    # 优先级 2: firewalld (CentOS / RHEL / AlmaLinux / Rocky / Fedora)
+    # firewalld
     if command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null; then
-        firewall-cmd --zone=public --add-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-        return
+        local fw_add_rc=0 fw_reload_rc=0
+        firewall-cmd --zone=public --add-port="${port}/tcp" --permanent >/dev/null 2>&1 || fw_add_rc=$?
+        firewall-cmd --reload >/dev/null 2>&1 || fw_reload_rc=$?
+        if [ "$fw_add_rc" -eq 0 ] && [ "$fw_reload_rc" -eq 0 ]; then
+            echo -e "  ${CYAN}ℹ 提醒：云厂商安全组仍需手动放行 ${port}/tcp${NC}"
+            return 0
+        fi
+        echo -e "  ${RED}✗ firewalld 处于 active 但放行端口 ${port} 失败${NC}"
+        echo -e "  ${YELLOW}  add-port rc=${fw_add_rc}, reload rc=${fw_reload_rc}${NC}"
+        echo -e "  ${YELLOW}  请手动执行:${NC}"
+        echo -e "  ${YELLOW}    firewall-cmd --zone=public --add-port=${port}/tcp --permanent${NC}"
+        echo -e "  ${YELLOW}    firewall-cmd --reload${NC}"
+        return 3
     fi
 
-    # 优先级 3: 裸 iptables（兜底）
-    iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+    # nftables：尝试自动放行
+    # 策略：如果存在 inet filter input chain 就往里加；否则尝试常见的 ip filter INPUT；都不行就警告
+    if command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q "^table"; then
+        local nft_added=0
 
-    if command -v netfilter-persistent &>/dev/null; then
-        netfilter-persistent save >/dev/null 2>&1 || true
-    elif [ -d /etc/iptables ]; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        # 尝试 inet filter input（systemd / 现代发行版默认）
+        if nft list chain inet filter input &>/dev/null; then
+            # 去重检查：rule 已经存在就跳过
+            if ! nft list chain inet filter input 2>/dev/null | grep -qE "tcp dport .*\b${port}\b.* accept"; then
+                if nft add rule inet filter input tcp dport "$port" accept 2>/dev/null; then
+                    nft_added=1
+                fi
+            else
+                nft_added=1   # 规则已存在视为成功
+            fi
+        fi
+
+        # 兜底：尝试 ip filter INPUT
+        if [ "$nft_added" -eq 0 ] && nft list chain ip filter INPUT &>/dev/null; then
+            if ! nft list chain ip filter INPUT 2>/dev/null | grep -qE "tcp dport .*\b${port}\b.* accept"; then
+                if nft add rule ip filter INPUT tcp dport "$port" accept 2>/dev/null; then
+                    nft_added=1
+                fi
+            else
+                nft_added=1
+            fi
+        fi
+
+        if [ "$nft_added" -eq 1 ]; then
+            # 持久化（如果支持）
+            if [ -d /etc/nftables.d ] || [ -f /etc/nftables.conf ]; then
+                # 不直接覆盖用户的 nftables.conf，仅尝试常见的持久化路径
+                nft list ruleset > /etc/nftables.conf.xray.bak 2>/dev/null || true
+            fi
+            echo -e "  ${GREEN}✓ 已通过 nftables 放行 ${port}/tcp${NC}"
+            echo -e "  ${YELLOW}  注意：规则未持久化，重启后可能失效${NC}"
+            echo -e "  ${YELLOW}  如需持久化，请手动追加到你的 nftables.conf 或 systemd unit${NC}"
+            echo -e "  ${CYAN}ℹ 提醒：云厂商安全组仍需手动放行 ${port}/tcp${NC}"
+            return 0
+        fi
+
+        # 自动放行失败：返回硬错误
+        echo -e "  ${RED}✗ 检测到 nftables，但未能自动放行端口 ${port}${NC}"
+        echo -e "  ${YELLOW}  外部连接很可能被默认 drop 策略丢弃，请手动执行：${NC}"
+        echo -e "  ${YELLOW}    nft add rule inet filter input tcp dport ${port} accept${NC}"
+        echo -e "  ${YELLOW}    （或写入你的 /etc/nftables.conf 后 nft -f 重新加载）${NC}"
+        echo -e "  ${CYAN}ℹ 提醒：云厂商安全组仍需手动放行 ${port}/tcp${NC}"
+        return 3
     fi
+
+    # iptables 兜底
+    if command -v iptables &>/dev/null; then
+        if iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+            :   # 已存在
+        else
+            local ipt_rc=0
+            iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || ipt_rc=$?
+            if [ "$ipt_rc" -ne 0 ]; then
+                echo -e "  ${RED}✗ iptables 插入规则失败 (rc=${ipt_rc})${NC}"
+                echo -e "  ${YELLOW}  请手动执行: iptables -I INPUT -p tcp --dport ${port} -j ACCEPT${NC}"
+                return 3
+            fi
+        fi
+        if command -v netfilter-persistent &>/dev/null; then
+            netfilter-persistent save >/dev/null 2>&1 || true
+        elif [ -d /etc/iptables ]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+        echo -e "  ${CYAN}ℹ 提醒：云厂商安全组仍需手动放行 ${port}/tcp${NC}"
+        return 0
+    fi
+
+    # 完全没有任何防火墙后端可用
+    echo -e "  ${YELLOW}⚠ 未检测到 ufw / firewalld / nftables / iptables，跳过${NC}"
+    echo -e "  ${CYAN}ℹ 如系统默认策略是 ACCEPT，无需操作；否则请手动放行 ${port}/tcp${NC}"
+    return 2
 }
 
 get_next_tag_num() {
     CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
-import json
-import os
-import re
-
-with open(os.environ["CONFIG_FILE"], "r") as f:
+import json, os, re
+with open(os.environ["CONFIG_FILE"]) as f:
     config = json.load(f)
-
 max_num = 0
 for inb in config.get("inbounds", []):
-    match = re.fullmatch(r"vless-in-(\d+)", inb.get("tag", ""))
-    if match:
-        max_num = max(max_num, int(match.group(1)))
-
+    m = re.fullmatch(r"vless-in-(\d+)", inb.get("tag", ""))
+    if m:
+        max_num = max(max_num, int(m.group(1)))
 print(max_num + 1)
 PYEOF
 }
@@ -207,21 +571,12 @@ PYEOF
 load_node_identity() {
     eval "$(
         CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
-import json
-import os
-import shlex
-
-with open(os.environ["CONFIG_FILE"], "r") as f:
+import json, os, shlex
+with open(os.environ["CONFIG_FILE"]) as f:
     config = json.load(f)
-
-private_key = ""
-short_id = ""
-uuid = ""
-
-# 所有业务 inbound 共享同一套 reality 密钥，取第一个即可
+private_key = ""; short_id = ""; uuid = ""
 for inb in config.get("inbounds", []):
-    if inb.get("tag") == "api-in":
-        continue
+    if inb.get("tag") == "api-in": continue
     reality = inb.get("streamSettings", {}).get("realitySettings", {})
     clients = inb.get("settings", {}).get("clients", [])
     private_key = reality.get("privateKey", "")
@@ -229,7 +584,6 @@ for inb in config.get("inbounds", []):
     short_id = short_ids[0] if short_ids else ""
     uuid = clients[0].get("id", "") if clients else ""
     break
-
 print(f"PRIVATE_KEY={shlex.quote(private_key)}")
 print(f"SHORT_ID={shlex.quote(short_id)}")
 print(f"UUID={shlex.quote(uuid)}")
@@ -237,44 +591,49 @@ PYEOF
     )"
 }
 
-# ========== 更新操作系统 ==========
+# ========== 系统更新 / 依赖安装 ==========
 update_system() {
-    echo -e "${GREEN}[步骤0] 更新操作系统...${NC}"
-    
+    echo -e "${GREEN}[步骤0] 安装必要依赖...${NC}"
+
     if command -v apt &>/dev/null; then
         export DEBIAN_FRONTEND=noninteractive
         apt update -y
-        apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
         apt install -y curl python3 iproute2 ca-certificates
-        apt autoremove -y
-        echo -e "  ${GREEN}✓ 系统已更新 (apt)${NC}"
+        if [ "${XRAY_FULL_UPGRADE:-0}" = "1" ]; then
+            echo -e "  ${YELLOW}XRAY_FULL_UPGRADE=1，执行完整系统升级...${NC}"
+            apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+            apt autoremove -y
+        else
+            echo -e "  ${CYAN}ℹ 仅安装依赖（如需整机升级请用 XRAY_FULL_UPGRADE=1 重跑）${NC}"
+        fi
+        echo -e "  ${GREEN}✓ 依赖已就绪 (apt)${NC}"
     elif command -v dnf &>/dev/null; then
-        dnf update -y
         dnf install -y curl python3 iproute ca-certificates
-        echo -e "  ${GREEN}✓ 系统已更新 (dnf)${NC}"
+        if [ "${XRAY_FULL_UPGRADE:-0}" = "1" ]; then
+            dnf update -y
+        fi
+        echo -e "  ${GREEN}✓ 依赖已就绪 (dnf)${NC}"
     elif command -v yum &>/dev/null; then
-        yum update -y
         yum install -y curl python3 iproute ca-certificates
-        echo -e "  ${GREEN}✓ 系统已更新 (yum)${NC}"
+        if [ "${XRAY_FULL_UPGRADE:-0}" = "1" ]; then
+            yum update -y
+        fi
+        echo -e "  ${GREEN}✓ 依赖已就绪 (yum)${NC}"
     else
-        echo -e "  ${YELLOW}⚠ 未识别的包管理器，跳过系统更新${NC}"
+        echo -e "  ${YELLOW}⚠ 未识别的包管理器，跳过自动安装${NC}"
     fi
 
-    # 硬性检查 python3（整个脚本强依赖）
     if ! command -v python3 &>/dev/null; then
         echo -e "  ${RED}✗ 未检测到 python3，脚本无法继续${NC}"
-        echo -e "  ${YELLOW}请手动安装 python3 后重新运行${NC}"
         exit 1
     fi
 }
 
-# ========== 安装 Xray ==========
 install_xray() {
     echo -e "${GREEN}[步骤1] 检查并安装 Xray...${NC}"
-    if command -v xray &> /dev/null; then
+    if command -v xray &>/dev/null; then
         echo "Xray 已安装: $(xray version | head -1)"
     else
-        echo "正在安装 Xray..."
         if ! run_xray_installer install; then
             echo -e "${RED}Xray 安装失败，无法继续部署${NC}"
             exit 1
@@ -290,43 +649,46 @@ generate_keys() {
     PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep -i "public" | awk '{print $NF}')
     SHORT_ID=$(python3 -c 'import os; print(os.urandom(8).hex())')
     UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())")
-    echo -e "  Private Key: ${YELLOW}${PRIVATE_KEY}${NC}"
+    echo -e "  Private Key: ${YELLOW}$(redact "$PRIVATE_KEY")${NC}"
     echo -e "  Public Key:  ${YELLOW}${PUBLIC_KEY}${NC}"
-    echo -e "  UUID:        ${YELLOW}${UUID}${NC}"
+    echo -e "  UUID:        ${YELLOW}$(redact "$UUID")${NC}"
     echo -e "  Short ID:    ${YELLOW}${SHORT_ID}${NC}"
 }
 
 collect_nodes() {
     echo ""
     echo -e "${GREEN}[步骤3] 添加 SOCKS5 住宅节点${NC}"
-    echo -e "${CYAN}格式: IP:端口:用户名:密码${NC}"
-    echo -e "${CYAN}例如: 161.77.77.5:12324:14a0f0ecfa3d6:384cafa39d${NC}"
-    echo -e "${CYAN}（如果暂无住宅节点，可直接输入 done 跳过，脚本会创建一个 443 端口的 VPS 直连节点作为起点）${NC}"
+    echo -e "${CYAN}支持两种格式：${NC}"
+    echo -e "${CYAN}  1) socks5://user:pass@host:port  (推荐，密码可含 :@/ 等特殊字符)${NC}"
+    echo -e "${CYAN}  2) host:port:user:pass            (旧格式，密码不能含 :)${NC}"
+    echo -e "${CYAN}（输入 done 跳过，脚本会创建一个 443 端口的 VPS 直连节点作为起点）${NC}"
     echo ""
 
-    # 节点数组内部分隔符：使用 ASCII US（Unit Separator, 0x1F），
-    # 避免与密码里可能出现的 | : 等常见字符冲突。
     local SEP=$'\x1f'
-
     NODES=()
     NODE_NUM=0
 
     while true; do
         NODE_NUM=$((NODE_NUM + 1))
-        read -p "节点${NODE_NUM} (输入 done 结束): " INPUT
+        local INPUT
+        read -rp "节点${NODE_NUM} (输入 done 结束): " INPUT
 
         if [ "$INPUT" = "done" ] || [ "$INPUT" = "d" ] || [ -z "$INPUT" ]; then
             if [ ${#NODES[@]} -eq 0 ]; then
-                # 空节点：二次确认是否创建"纯直连"起步配置
                 echo ""
                 echo -e "${YELLOW}你还没有添加任何住宅 SOCKS5 节点。${NC}"
                 echo -e "${YELLOW}是否创建一个 443 端口的 VPS 直连节点作为起点？${NC}"
-                echo -e "${CYAN}（流量将直接从 VPS 机房 IP 出口，不经过住宅 IP；之后可随时通过菜单选项 2 追加住宅节点）${NC}"
-                read -p "输入 y 创建直连起步节点 / 其他任意键继续录入住宅节点: " EMPTY_CHOICE
+                local EMPTY_CHOICE
+                read -rp "输入 y 创建直连起步节点 / 其他键继续录入: " EMPTY_CHOICE
                 if [ "$EMPTY_CHOICE" = "y" ] || [ "$EMPTY_CHOICE" = "Y" ]; then
-                    # 哨兵格式：S_HOST=__DIRECT__ 表示这是直连节点，S_PORT/USER/PASS 留空
-                    NODES+=("443${SEP}__DIRECT__${SEP}${SEP}${SEP}${SEP}VPS-Direct")
-                    echo -e "${GREEN}  ✓ 已添加直连起步节点: VPS-Direct (监听端口: 443)${NC}"
+                    local DIRECT_NAME
+                    read -rp "  备注名称 (如 LA-Direct / JP-Direct，回车默认 VPS-Direct): " DIRECT_NAME
+                    [ -z "$DIRECT_NAME" ] && DIRECT_NAME="VPS-Direct"
+                    # 清理 URL 片段里的不安全字符（与其他节点录入保持一致）
+                    DIRECT_NAME=$(echo "$DIRECT_NAME" | tr ' \t#?&\r\n' '-' | tr -s '-' | sed 's/^-//; s/-$//')
+                    [ -z "$DIRECT_NAME" ] && DIRECT_NAME="VPS-Direct"
+                    NODES+=("443${SEP}__DIRECT__${SEP}${SEP}${SEP}${SEP}${DIRECT_NAME}")
+                    echo -e "${GREEN}  ✓ 已添加直连起步节点: ${DIRECT_NAME} (监听端口: 443)${NC}"
                     break
                 fi
                 NODE_NUM=0
@@ -335,30 +697,67 @@ collect_nodes() {
             break
         fi
 
-        IFS=':' read -r S_HOST S_PORT S_USER S_PASS <<< "$INPUT"
-
-        if [ -z "$S_HOST" ] || [ -z "$S_PORT" ] || [ -z "$S_USER" ] || [ -z "$S_PASS" ]; then
-            echo -e "${RED}格式错误，请使用 IP:端口:用户名:密码${NC}"
+        # 严格解析 + 校验
+        if ! ( PARSED_HOST="" ; PARSED_PORT="" ; PARSED_USER="" ; PARSED_PASS="" ;
+               INPUT="$INPUT" python3 -c '
+import os, sys, re
+from urllib.parse import urlsplit, unquote
+raw = os.environ["INPUT"].strip()
+def fail(m): print("ERR\t"+m); sys.exit(0)
+def ok(h,p,u,w):
+    try: p=int(p)
+    except: fail("端口非数字")
+    if not(1<=p<=65535): fail("端口范围 1-65535")
+    if not h: fail("host 为空")
+    if not u: fail("用户名为空")
+    if not w: fail("密码为空")
+    print("OK\t"+"\x1f".join([h,str(p),u,w])); sys.exit(0)
+if raw.startswith(("socks5://","socks://")):
+    try:
+        u=urlsplit(raw); h=u.hostname; po=u.port; un=u.username; pw=u.password
+    except (ValueError, Exception) as e:
+        fail(f"URL 解析失败: {e}")
+    if not h or not po: fail("URL 缺少 host/port")
+    ok(h,po,unquote(un or ""),unquote(pw or ""))
+m=re.match(r"^\[([0-9a-fA-F:]+)\]:(\d+):([^:]+):(.+)$", raw)
+if m: ok(m.group(1),m.group(2),m.group(3),m.group(4))
+parts=raw.split(":")
+if len(parts)!=4: fail(f"格式错误：旧格式需 3 个冒号 (实际 {len(parts)-1});密码含特殊字符请用 socks5:// URL")
+ok(*parts)
+' > /tmp/.xray_parse_$$ 2>&1 ); then
+            echo -e "${RED}解析失败${NC}"
+            rm -f "/tmp/.xray_parse_$$"
             NODE_NUM=$((NODE_NUM - 1))
             continue
         fi
 
-        # 第一个节点用 443（HTTPS 特权端口），第二个起从 8443 段递增
+        local parsed
+        parsed=$(cat "/tmp/.xray_parse_$$")
+        rm -f "/tmp/.xray_parse_$$"
+        if [[ "$parsed" != OK* ]]; then
+            echo -e "${RED}格式错误: ${parsed#ERR	}${NC}"
+            NODE_NUM=$((NODE_NUM - 1))
+            continue
+        fi
+        local payload="${parsed#OK	}"
+        local S_HOST S_PORT S_USER S_PASS
+        IFS=$'\x1f' read -r S_HOST S_PORT S_USER S_PASS <<< "$payload"
+
+        local LISTEN_PORT
         if [ $NODE_NUM -eq 1 ]; then
             LISTEN_PORT=443
         else
             LISTEN_PORT=$((8442 + NODE_NUM))
         fi
 
-        read -p "  备注名称 (如 KR-Seoul / US-LA，回车跳过): " NODE_NAME
+        local NODE_NAME
+        read -rp "  备注名称 (如 KR-Seoul / US-LA，回车跳过): " NODE_NAME
         [ -z "$NODE_NAME" ] && NODE_NAME="Node-${NODE_NUM}"
-        # 清理 URL 片段里的不安全字符（空格/井号/问号/&/换行/制表），
-        # 否则客户端（V2rayN 等）从剪贴板导入时会按空格/# 截断链接。
         NODE_NAME=$(echo "$NODE_NAME" | tr ' \t#?&\r\n' '-' | tr -s '-' | sed 's/^-//; s/-$//')
         [ -z "$NODE_NAME" ] && NODE_NAME="Node-${NODE_NUM}"
 
         NODES+=("${LISTEN_PORT}${SEP}${S_HOST}${SEP}${S_PORT}${SEP}${S_USER}${SEP}${S_PASS}${SEP}${NODE_NAME}")
-        echo -e "${GREEN}  ✓ 已添加: ${NODE_NAME} → ${S_HOST}:${S_PORT} (监听端口: ${LISTEN_PORT})${NC}"
+        echo -e "${GREEN}  ✓ 已添加: ${NODE_NAME} → ${S_HOST}:${S_PORT} (监听 ${LISTEN_PORT})${NC}"
         echo ""
     done
 }
@@ -367,110 +766,76 @@ generate_config() {
     echo -e "${GREEN}[步骤4] 生成 Xray 配置文件...${NC}"
     NODES_DATA=$(printf '%s\n' "${NODES[@]}")
 
-    CONFIG_FILE="$CONFIG_FILE" \
+    local NEW_CONFIG="/tmp/.xray_config.new.$$.json"
+
+    NEW_CONFIG_FILE="$NEW_CONFIG" \
     UUID="$UUID" \
     PRIVATE_KEY="$PRIVATE_KEY" \
     SHORT_ID="$SHORT_ID" \
     NODES_DATA="$NODES_DATA" \
     python3 << 'PYEOF'
-import json
-import os
-
-config_file = os.environ["CONFIG_FILE"]
+import json, os
+new_config = os.environ["NEW_CONFIG_FILE"]
 uuid = os.environ["UUID"]
 private_key = os.environ["PRIVATE_KEY"]
 short_id = os.environ["SHORT_ID"]
 raw_nodes = [line for line in os.environ["NODES_DATA"].splitlines() if line.strip()]
 
-inbounds = [{
-    "tag": "api-in",
-    "port": 10085,
-    "listen": "127.0.0.1",
-    "protocol": "dokodemo-door",
-    "settings": {"address": "127.0.0.1"}
-}]
+inbounds = [{"tag":"api-in","port":10085,"listen":"127.0.0.1","protocol":"dokodemo-door","settings":{"address":"127.0.0.1"}}]
 outbounds = []
 rules = [
-    {"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"},
-    {"type": "field", "outboundTag": "block", "protocol": ["bittorrent"]},
-    {"type": "field", "outboundTag": "direct", "ip": ["geoip:private"]},
+    {"type":"field","inboundTag":["api-in"],"outboundTag":"api"},
+    {"type":"field","outboundTag":"block","protocol":["bittorrent"]},
+    {"type":"field","outboundTag":"direct","ip":["geoip:private"]},
 ]
 
 for idx, node in enumerate(raw_nodes, start=1):
     port, s_host, s_port, s_user, s_pass, name = node.split("\x1f", 5)
     tag_in = f"vless-in-{idx}"
-
     inbounds.append({
-        "tag": tag_in,
-        "port": int(port),
-        "protocol": "vless",
-        "settings": {
-            "clients": [{"id": uuid, "flow": "xtls-rprx-vision"}],
-            "decryption": "none"
-        },
-        "streamSettings": {
-            "network": "tcp",
-            "security": "reality",
-            "realitySettings": {
-                "dest": "www.microsoft.com:443",
-                "serverNames": ["www.microsoft.com"],
-                "privateKey": private_key,
-                "shortIds": [short_id]
-            },
-            "sockopt": {"tcpFastOpen": True, "tcpNoDelay": True}
-        },
-        "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
+        "tag": tag_in, "port": int(port), "protocol": "vless",
+        "settings": {"clients":[{"id":uuid,"flow":"xtls-rprx-vision"}],"decryption":"none"},
+        "streamSettings": {"network":"tcp","security":"reality",
+            "realitySettings":{"dest":"www.microsoft.com:443","serverNames":["www.microsoft.com"],
+                "privateKey":private_key,"shortIds":[short_id]},
+            "sockopt":{"tcpFastOpen":True,"tcpNoDelay":True}},
+        "sniffing":{"enabled":True,"destOverride":["http","tls"]}
     })
-
-    # 哨兵 __DIRECT__：这是 VPS 直连节点，不创建 socks5-out 出站，路由直接指向全局 direct
     if s_host == "__DIRECT__":
-        rules.append({"type": "field", "inboundTag": [tag_in], "outboundTag": "direct"})
+        rules.append({"type":"field","inboundTag":[tag_in],"outboundTag":"direct"})
         continue
-
     tag_out = f"socks5-out-{idx}"
     outbounds.append({
-        "tag": tag_out,
-        "protocol": "socks",
-        "settings": {"servers": [{
-            "address": s_host,
-            "port": int(s_port),
-            "users": [{"user": s_user, "pass": s_pass}]
-        }]},
-        "streamSettings": {"sockopt": {"tcpFastOpen": True, "tcpNoDelay": True}}
+        "tag": tag_out, "protocol": "socks",
+        "settings":{"servers":[{"address":s_host,"port":int(s_port),"users":[{"user":s_user,"pass":s_pass}]}]},
+        "streamSettings":{"sockopt":{"tcpFastOpen":True,"tcpNoDelay":True}}
     })
-
-    rules.append({"type": "field", "inboundTag": [tag_in], "outboundTag": tag_out})
+    rules.append({"type":"field","inboundTag":[tag_in],"outboundTag":tag_out})
 
 config = {
-    "log": {"loglevel": "warning"},
-    "stats": {},
-    "api": {"tag": "api", "services": ["StatsService"]},
-    "policy": {
-        "system": {
-            "statsInboundUplink": True,
-            "statsInboundDownlink": True,
-            "statsOutboundUplink": True,
-            "statsOutboundDownlink": True
-        }
-    },
+    "log":{"loglevel":"warning"},"stats":{},
+    "api":{"tag":"api","services":["StatsService"]},
+    "policy":{"system":{"statsInboundUplink":True,"statsInboundDownlink":True,
+                        "statsOutboundUplink":True,"statsOutboundDownlink":True}},
     "inbounds": inbounds,
-    "outbounds": outbounds + [
-        {"tag": "direct", "protocol": "freedom"},
-        {"tag": "block", "protocol": "blackhole"}
-    ],
-    "routing": {"domainStrategy": "IPIfNonMatch", "rules": rules}
+    "outbounds": outbounds + [{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+    "routing":{"domainStrategy":"IPIfNonMatch","rules":rules}
 }
-
-with open(config_file, "w") as f:
+with open(new_config,"w") as f:
     json.dump(config, f, indent=4)
+os.chmod(new_config, 0o600)
 PYEOF
+
+    if ! validate_and_install_config "$NEW_CONFIG"; then
+        echo -e "${RED}配置生成失败，部署终止${NC}"
+        exit 1
+    fi
     echo -e "  ✓ 配置已写入 ${CONFIG_FILE}"
     echo -e "  ✓ 流量统计 API 已启用 (端口 10085)"
 }
 
 optimize_system() {
     echo -e "${GREEN}[步骤5] 系统优化 (BBR + 内核参数)...${NC}"
-
     if [ -f "$SYSCTL_FILE" ]; then
         echo "  sysctl 优化配置已存在，跳过写入"
     else
@@ -509,7 +874,6 @@ EOF
         echo "  ✓ 文件描述符限制已提升"
     fi
 
-    # 检查系统是否已有任何 swap（不仅仅是 /swapfile）
     CURRENT_SWAP=$(free | awk '/Swap:/ {print $2}')
     if [ "${CURRENT_SWAP:-0}" -eq 0 ] && [ ! -f /swapfile ]; then
         if fallocate -l 1G /swapfile 2>/dev/null && \
@@ -529,10 +893,17 @@ EOF
 
 setup_firewall() {
     echo -e "${GREEN}[步骤6] 配置防火墙...${NC}"
+    local fw_rc
     for NODE in "${NODES[@]}"; do
         IFS=$'\x1f' read -r PORT _ _ _ _ _ <<< "$NODE"
-        apply_firewall_port "$PORT"
-        echo "  ✓ 端口 ${PORT} 已放行"
+        fw_rc=0
+        apply_firewall_port "$PORT" || fw_rc=$?
+        case "$fw_rc" in
+            0) echo "  ✓ 端口 ${PORT} 已放行" ;;
+            2) echo -e "  ${YELLOW}⚠ 端口 ${PORT}: 未检测到防火墙，未做放行${NC}" ;;
+            3) echo -e "  ${RED}⚠ 端口 ${PORT}: 防火墙自动放行失败，外部连接可能不通！请按上方提示手动处理${NC}" ;;
+            *) echo -e "  ${RED}⚠ 端口 ${PORT}: 防火墙处理异常 (rc=${fw_rc})${NC}" ;;
+        esac
     done
 }
 
@@ -540,10 +911,7 @@ start_service() {
     echo -e "${GREEN}[步骤7] 启动 Xray...${NC}"
     systemctl daemon-reload
     systemctl enable xray
-    systemctl restart xray
-    sleep 2
-
-    if systemctl is-active --quiet xray; then
+    if restart_with_rollback; then
         echo -e "  ${GREEN}✓ Xray 启动成功！${NC}"
     else
         echo -e "  ${RED}✗ 启动失败，查看日志: journalctl -u xray -n 20${NC}"
@@ -553,18 +921,16 @@ start_service() {
 
 print_result() {
     VPS_IP=$(get_ip)
-
     echo ""
     echo -e "${CYAN}╔═══════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║              部署完成！                       ║${NC}"
     echo -e "${CYAN}╚═══════════════════════════════════════════════╝${NC}"
     echo ""
-
-    > "$INFO_FILE"
+    : > "$INFO_FILE"
+    chmod 600 "$INFO_FILE"
 
     for i in "${!NODES[@]}"; do
         IFS=$'\x1f' read -r PORT S_HOST S_PORT S_USER S_PASS NAME <<< "${NODES[$i]}"
-
         LINK="vless://${UUID}@${VPS_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NAME}"
 
         echo -e "${GREEN}━━━ ${NAME} ━━━${NC}"
@@ -577,444 +943,419 @@ print_result() {
         echo -e "${YELLOW}  ${LINK}${NC}"
         echo ""
 
-        echo "=== ${NAME} ===" >> "$INFO_FILE"
-        echo "端口: ${PORT}" >> "$INFO_FILE"
-        if [ "$S_HOST" = "__DIRECT__" ]; then
-            echo "出口: VPS 直连 (${VPS_IP})" >> "$INFO_FILE"
-        else
-            echo "落地: ${S_HOST}:${S_PORT}" >> "$INFO_FILE"
-        fi
-        echo "链接: ${LINK}" >> "$INFO_FILE"
-        echo "" >> "$INFO_FILE"
+        {
+            echo "=== ${NAME} ==="
+            echo "端口: ${PORT}"
+            if [ "$S_HOST" = "__DIRECT__" ]; then
+                echo "出口: VPS 直连 (${VPS_IP})"
+            else
+                echo "落地: ${S_HOST}:${S_PORT}"
+            fi
+            echo "链接: ${LINK}"
+            echo ""
+        } >> "$INFO_FILE"
 
-        # 显示该节点的二维码，方便客户端扫码导入
         show_qrcode "$LINK" "$NAME"
     done
 
     echo -e "${GREEN}━━━ 通用信息 ━━━${NC}"
     echo -e "  VPS IP:     ${VPS_IP}"
-    echo -e "  UUID:       ${UUID}"
+    echo -e "  UUID:       $(redact "$UUID")"
     echo -e "  Public Key: ${PUBLIC_KEY}"
     echo -e "  Short ID:   ${SHORT_ID}"
     echo ""
-    echo -e "${GREEN}所有链接已保存到 ${INFO_FILE}${NC}"
+    echo -e "${GREEN}所有链接已保存到 ${INFO_FILE} (权限 600)${NC}"
+    if [ "$XRAY_REDACT" = "1" ]; then
+        echo -e "${YELLOW}（敏感字段已隐藏，需查看完整信息请用 XRAY_REDACT=0 重跑或直接查看 INFO_FILE）${NC}"
+    fi
 }
 
+# ========== 添加节点（住宅 SOCKS5）==========
 add_node() {
     echo -e "${GREEN}[添加节点模式]${NC}"
-    
     VPS_IP=$(get_ip)
-    
+
     if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "${RED}未找到现有配置，请先完整安装！${NC}"
-        exit 1
+        return
     fi
 
     load_node_identity
-
     if [ -z "$PRIVATE_KEY" ] || [ -z "$SHORT_ID" ] || [ -z "$UUID" ]; then
-        echo -e "${RED}现有配置中的业务节点密钥信息不完整，无法添加节点${NC}"
-        exit 1
+        echo -e "${RED}现有配置中的业务节点密钥信息不完整${NC}"
+        return
     fi
-    
     PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
 
     NEW_PORT=$(get_next_inbound_port)
     if [[ "$NEW_PORT" == ERROR:* ]]; then
-        echo -e "${RED}${NEW_PORT}${NC}"
-        exit 1
+        echo -e "${RED}${NEW_PORT}${NC}"; return
     fi
     while port_in_use "$NEW_PORT"; do
         NEW_PORT=$((NEW_PORT + 1))
         if [ "$NEW_PORT" -gt 20000 ]; then
-            echo -e "${RED}未找到可用监听端口，请手动检查端口占用${NC}"
-            exit 1
+            echo -e "${RED}未找到可用监听端口${NC}"; return
         fi
     done
-
     echo -e "新的监听端口: ${NEW_PORT}"
-    echo ""
-    echo -e "${CYAN}输入新的 SOCKS5 节点 (格式: IP:端口:用户名:密码)${NC}"
-    read -p "节点信息: " INPUT
 
-    IFS=':' read -r S_HOST S_PORT S_USER S_PASS <<< "$INPUT"
-    if [ -z "$S_HOST" ] || [ -z "$S_PORT" ] || [ -z "$S_USER" ] || [ -z "$S_PASS" ]; then
-        echo -e "${RED}格式错误！${NC}"
-        exit 1
-    fi
+    # 严格解析 SOCKS5 输入
+    PARSED_HOST="" PARSED_PORT="" PARSED_USER="" PARSED_PASS=""
+    read_socks5 "节点信息 (socks5://user:pass@host:port 或 host:port:user:pass): "
+    local S_HOST="$PARSED_HOST" S_PORT="$PARSED_PORT" S_USER="$PARSED_USER" S_PASS="$PARSED_PASS"
 
-    read -p "备注名称: " NODE_NAME
+    local NODE_NAME
+    read -rp "备注名称: " NODE_NAME
     [ -z "$NODE_NAME" ] && NODE_NAME="Node-new"
-    # 清理 URL 片段里的不安全字符
     NODE_NAME=$(echo "$NODE_NAME" | tr ' \t#?&\r\n' '-' | tr -s '-' | sed 's/^-//; s/-$//')
     [ -z "$NODE_NAME" ] && NODE_NAME="Node-new"
 
     TAG_NUM=$(get_next_tag_num)
 
-    CONFIG_FILE="$CONFIG_FILE" \
-    TAG_NUM="$TAG_NUM" \
-    NEW_PORT="$NEW_PORT" \
-    UUID="$UUID" \
-    PRIVATE_KEY="$PRIVATE_KEY" \
-    SHORT_ID="$SHORT_ID" \
-    S_HOST="$S_HOST" \
-    S_PORT="$S_PORT" \
-    S_USER="$S_USER" \
-    S_PASS="$S_PASS" \
-    python3 << 'PYEOF'
-import json
-import os
+    local NEW_CONFIG="/tmp/.xray_config.new.$$.json"
+    cp -a "$CONFIG_FILE" "$NEW_CONFIG"
 
-config_file = os.environ["CONFIG_FILE"]
+    if ! NEW_CONFIG_FILE="$NEW_CONFIG" \
+        TAG_NUM="$TAG_NUM" NEW_PORT="$NEW_PORT" UUID="$UUID" \
+        PRIVATE_KEY="$PRIVATE_KEY" SHORT_ID="$SHORT_ID" \
+        S_HOST="$S_HOST" S_PORT="$S_PORT" S_USER="$S_USER" S_PASS="$S_PASS" \
+        python3 << 'PYEOF'
+import json, os, sys
+new_config = os.environ["NEW_CONFIG_FILE"]
 tag_num = os.environ["TAG_NUM"]
 new_port = int(os.environ["NEW_PORT"])
 uuid = os.environ["UUID"]
 private_key = os.environ["PRIVATE_KEY"]
 short_id = os.environ["SHORT_ID"]
 s_host = os.environ["S_HOST"]
-s_port = int(os.environ["S_PORT"])
+try:
+    s_port = int(os.environ["S_PORT"])
+except ValueError:
+    print("S_PORT 非数字"); sys.exit(2)
 s_user = os.environ["S_USER"]
 s_pass = os.environ["S_PASS"]
 
-with open(config_file, "r") as f:
+with open(new_config) as f:
     config = json.load(f)
 
 config["inbounds"].append({
-    "tag": f"vless-in-{tag_num}",
-    "port": new_port,
-    "protocol": "vless",
-    "settings": {
-        "clients": [{"id": uuid, "flow": "xtls-rprx-vision"}],
-        "decryption": "none"
-    },
-    "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-            "dest": "www.microsoft.com:443",
-            "serverNames": ["www.microsoft.com"],
-            "privateKey": private_key,
-            "shortIds": [short_id]
-        },
-        "sockopt": {"tcpFastOpen": True, "tcpNoDelay": True}
-    },
-    "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
+    "tag": f"vless-in-{tag_num}", "port": new_port, "protocol": "vless",
+    "settings": {"clients":[{"id":uuid,"flow":"xtls-rprx-vision"}],"decryption":"none"},
+    "streamSettings": {"network":"tcp","security":"reality",
+        "realitySettings":{"dest":"www.microsoft.com:443","serverNames":["www.microsoft.com"],
+            "privateKey":private_key,"shortIds":[short_id]},
+        "sockopt":{"tcpFastOpen":True,"tcpNoDelay":True}},
+    "sniffing":{"enabled":True,"destOverride":["http","tls"]}
 })
 
 new_out = {
-    "tag": f"socks5-out-{tag_num}",
-    "protocol": "socks",
-    "settings": {"servers": [{
-        "address": s_host,
-        "port": s_port,
-        "users": [{"user": s_user, "pass": s_pass}]
-    }]},
-    "streamSettings": {"sockopt": {"tcpFastOpen": True, "tcpNoDelay": True}}
+    "tag": f"socks5-out-{tag_num}", "protocol": "socks",
+    "settings":{"servers":[{"address":s_host,"port":s_port,"users":[{"user":s_user,"pass":s_pass}]}]},
+    "streamSettings":{"sockopt":{"tcpFastOpen":True,"tcpNoDelay":True}}
 }
 for idx, ob in enumerate(config["outbounds"]):
     if ob.get("tag") == "direct":
-        config["outbounds"].insert(idx, new_out)
-        break
+        config["outbounds"].insert(idx, new_out); break
 else:
     config["outbounds"].append(new_out)
 
-new_rule = {"type": "field", "inboundTag": [f"vless-in-{tag_num}"], "outboundTag": f"socks5-out-{tag_num}"}
-config["routing"]["rules"].append(new_rule)
+config["routing"]["rules"].append(
+    {"type":"field","inboundTag":[f"vless-in-{tag_num}"],"outboundTag":f"socks5-out-{tag_num}"})
 
-with open(config_file, "w") as f:
+with open(new_config, "w") as f:
     json.dump(config, f, indent=4)
-
-print("配置已更新")
 PYEOF
+    then
+        echo -e "${RED}配置生成失败${NC}"
+        rm -f "$NEW_CONFIG"
+        return
+    fi
 
-    apply_firewall_port "$NEW_PORT"
+    if ! validate_and_install_config "$NEW_CONFIG"; then
+        echo -e "${RED}新配置校验失败，已保留原配置${NC}"
+        return
+    fi
 
-    systemctl restart xray
-    sleep 2
+    apply_firewall_port_capture "$NEW_PORT"
 
-    if systemctl is-active --quiet xray; then
+    if restart_with_rollback; then
         LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
         echo ""
         echo -e "${GREEN}✓ 节点添加成功！${NC}"
         echo -e "${GREEN}端口: ${NEW_PORT}${NC}"
         echo -e "${GREEN}落地: ${S_HOST}:${S_PORT}${NC}"
+        echo -e "  $(format_fw_status)"
         echo -e "${YELLOW}${LINK}${NC}"
-
-        echo "" >> "$INFO_FILE"
-        echo "=== ${NODE_NAME} ===" >> "$INFO_FILE"
-        echo "端口: ${NEW_PORT}" >> "$INFO_FILE"
-        echo "落地: ${S_HOST}:${S_PORT}" >> "$INFO_FILE"
-        echo "链接: ${LINK}" >> "$INFO_FILE"
-
+        {
+            echo ""
+            echo "=== ${NODE_NAME} ==="
+            echo "端口: ${NEW_PORT}"
+            echo "落地: ${S_HOST}:${S_PORT}"
+            echo "链接: ${LINK}"
+        } >> "$INFO_FILE"
+        chmod 600 "$INFO_FILE"
         show_qrcode "$LINK" "$NODE_NAME"
-    else
-        echo -e "${RED}重启失败: journalctl -u xray -n 20${NC}"
     fi
 }
 
-# ========== 添加 VPS 直连节点（不经住宅 IP）==========
+# ========== 添加 VPS 直连节点 ==========
 add_direct_node() {
     echo -e "${GREEN}[添加 VPS 直连节点]${NC}"
-    echo -e "${CYAN}此模式不经过住宅 SOCKS5，流量直接从 VPS 出口访问目标站点。${NC}"
-    echo -e "${CYAN}目标网站看到的将是你 VPS 的机房 IP。${NC}"
-    echo ""
-
+    echo -e "${CYAN}流量直接从 VPS 出口，目标看到的是机房 IP。${NC}"
     VPS_IP=$(get_ip)
 
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}未找到现有配置，请先完成【全新安装】(选项 1)！${NC}"
-        return
+        echo -e "${RED}未找到现有配置，请先完成【全新安装】！${NC}"; return
     fi
 
     load_node_identity
-
     if [ -z "$PRIVATE_KEY" ] || [ -z "$SHORT_ID" ] || [ -z "$UUID" ]; then
-        echo -e "${RED}现有配置中的业务节点密钥信息不完整，无法添加节点${NC}"
-        return
+        echo -e "${RED}现有配置密钥信息不完整${NC}"; return
     fi
-
     PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
 
     NEW_PORT=$(get_next_inbound_port)
     if [[ "$NEW_PORT" == ERROR:* ]]; then
-        echo -e "${RED}${NEW_PORT}${NC}"
-        return
+        echo -e "${RED}${NEW_PORT}${NC}"; return
     fi
     while port_in_use "$NEW_PORT"; do
         NEW_PORT=$((NEW_PORT + 1))
-        if [ "$NEW_PORT" -gt 20000 ]; then
-            echo -e "${RED}未找到可用监听端口，请手动检查端口占用${NC}"
-            return
-        fi
+        if [ "$NEW_PORT" -gt 20000 ]; then echo -e "${RED}无可用端口${NC}"; return; fi
     done
-
     echo -e "新的监听端口: ${NEW_PORT}"
 
-    read -p "备注名称 (如 VPS-Direct / JP-Direct，回车默认 VPS-Direct): " NODE_NAME
+    local NODE_NAME
+    read -rp "备注名称 (默认 VPS-Direct): " NODE_NAME
     [ -z "$NODE_NAME" ] && NODE_NAME="VPS-Direct"
-    # 清理 URL 片段里的不安全字符
     NODE_NAME=$(echo "$NODE_NAME" | tr ' \t#?&\r\n' '-' | tr -s '-' | sed 's/^-//; s/-$//')
     [ -z "$NODE_NAME" ] && NODE_NAME="VPS-Direct"
 
     TAG_NUM=$(get_next_tag_num)
 
-    CONFIG_FILE="$CONFIG_FILE" \
-    TAG_NUM="$TAG_NUM" \
-    NEW_PORT="$NEW_PORT" \
-    UUID="$UUID" \
-    PRIVATE_KEY="$PRIVATE_KEY" \
-    SHORT_ID="$SHORT_ID" \
-    python3 << 'PYEOF'
-import json
-import os
+    local NEW_CONFIG="/tmp/.xray_config.new.$$.json"
+    cp -a "$CONFIG_FILE" "$NEW_CONFIG"
 
-config_file = os.environ["CONFIG_FILE"]
+    if ! NEW_CONFIG_FILE="$NEW_CONFIG" \
+        TAG_NUM="$TAG_NUM" NEW_PORT="$NEW_PORT" UUID="$UUID" \
+        PRIVATE_KEY="$PRIVATE_KEY" SHORT_ID="$SHORT_ID" \
+        python3 << 'PYEOF'
+import json, os
+new_config = os.environ["NEW_CONFIG_FILE"]
 tag_num = os.environ["TAG_NUM"]
 new_port = int(os.environ["NEW_PORT"])
-uuid = os.environ["UUID"]
-private_key = os.environ["PRIVATE_KEY"]
-short_id = os.environ["SHORT_ID"]
+uuid = os.environ["UUID"]; private_key = os.environ["PRIVATE_KEY"]; short_id = os.environ["SHORT_ID"]
 
-with open(config_file, "r") as f:
+with open(new_config) as f:
     config = json.load(f)
 
-# 入站：和住宅节点同样的 VLESS+REALITY 设置，只是路由指向 direct
 config["inbounds"].append({
-    "tag": f"vless-in-{tag_num}",
-    "port": new_port,
-    "protocol": "vless",
-    "settings": {
-        "clients": [{"id": uuid, "flow": "xtls-rprx-vision"}],
-        "decryption": "none"
-    },
-    "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-            "dest": "www.microsoft.com:443",
-            "serverNames": ["www.microsoft.com"],
-            "privateKey": private_key,
-            "shortIds": [short_id]
-        },
-        "sockopt": {"tcpFastOpen": True, "tcpNoDelay": True}
-    },
-    "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
+    "tag": f"vless-in-{tag_num}", "port": new_port, "protocol": "vless",
+    "settings": {"clients":[{"id":uuid,"flow":"xtls-rprx-vision"}],"decryption":"none"},
+    "streamSettings": {"network":"tcp","security":"reality",
+        "realitySettings":{"dest":"www.microsoft.com:443","serverNames":["www.microsoft.com"],
+            "privateKey":private_key,"shortIds":[short_id]},
+        "sockopt":{"tcpFastOpen":True,"tcpNoDelay":True}},
+    "sniffing":{"enabled":True,"destOverride":["http","tls"]}
 })
 
-# 确保 direct 出站存在（全新安装一定会生成；防御性保底）
-if not any(ob.get("tag") == "direct" for ob in config.get("outbounds", [])):
-    config.setdefault("outbounds", []).append({"tag": "direct", "protocol": "freedom"})
+if not any(ob.get("tag")=="direct" for ob in config.get("outbounds",[])):
+    config.setdefault("outbounds",[]).append({"tag":"direct","protocol":"freedom"})
 
-# 路由：该入站 → direct，不走任何 SOCKS5
-new_rule = {"type": "field", "inboundTag": [f"vless-in-{tag_num}"], "outboundTag": "direct"}
-config.setdefault("routing", {}).setdefault("rules", []).append(new_rule)
+config.setdefault("routing",{}).setdefault("rules",[]).append(
+    {"type":"field","inboundTag":[f"vless-in-{tag_num}"],"outboundTag":"direct"})
 
-with open(config_file, "w") as f:
+with open(new_config, "w") as f:
     json.dump(config, f, indent=4)
-
-print("直连节点配置已更新")
 PYEOF
+    then
+        echo -e "${RED}配置生成失败${NC}"
+        rm -f "$NEW_CONFIG"
+        return
+    fi
 
-    apply_firewall_port "$NEW_PORT"
+    if ! validate_and_install_config "$NEW_CONFIG"; then
+        echo -e "${RED}配置校验失败${NC}"; return
+    fi
 
-    systemctl restart xray
-    sleep 2
+    apply_firewall_port_capture "$NEW_PORT"
 
-    if systemctl is-active --quiet xray; then
+    if restart_with_rollback; then
         LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
         echo ""
         echo -e "${GREEN}✓ VPS 直连节点添加成功！${NC}"
         echo -e "${GREEN}端口: ${NEW_PORT}${NC}"
         echo -e "${GREEN}出口: VPS 直连 (${VPS_IP})${NC}"
+        echo -e "  $(format_fw_status)"
         echo -e "${YELLOW}${LINK}${NC}"
-
-        echo "" >> "$INFO_FILE"
-        echo "=== ${NODE_NAME} ===" >> "$INFO_FILE"
-        echo "端口: ${NEW_PORT}" >> "$INFO_FILE"
-        echo "出口: VPS 直连 (${VPS_IP})" >> "$INFO_FILE"
-        echo "链接: ${LINK}" >> "$INFO_FILE"
-
+        {
+            echo ""
+            echo "=== ${NODE_NAME} ==="
+            echo "端口: ${NEW_PORT}"
+            echo "出口: VPS 直连 (${VPS_IP})"
+            echo "链接: ${LINK}"
+        } >> "$INFO_FILE"
+        chmod 600 "$INFO_FILE"
         show_qrcode "$LINK" "$NODE_NAME"
-    else
-        echo -e "${RED}重启失败: journalctl -u xray -n 20${NC}"
     fi
 }
 
 show_status() {
     echo -e "${GREEN}━━━ Xray 状态 ━━━${NC}"
-    # systemctl status 在服务非 active 时返回非零，set -e 下需要兜底
     systemctl status xray --no-pager -l || true
     echo ""
     echo -e "${GREEN}━━━ BBR 状态 ━━━${NC}"
-    # 某些精简内核/首次部署前可能没有此 sysctl 键，避免触发 set -e 直接退出
     sysctl net.ipv4.tcp_congestion_control 2>/dev/null || echo "BBR 尚未配置"
     echo ""
     echo -e "${GREEN}━━━ 节点信息 ━━━${NC}"
-    if [ -f "$INFO_FILE" ]; then
-        cat "$INFO_FILE"
-    else
+    if [ ! -f "$INFO_FILE" ]; then
         echo "暂无节点信息"
+        return
     fi
+    cat "$INFO_FILE"
+
+    # 解析 INFO_FILE 里所有节点（名称 + 链接），让用户选择是否扫码
+    # INFO_FILE 的结构（由 print_result / add_node / add_direct_node 写入）:
+    #   === <名称> ===
+    #   端口: ...
+    #   出口/落地: ...
+    #   链接: vless://...
+    #   <空行>
+    local names=() links=()
+    local cur_name="" cur_link=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" =~ ^===\ (.+)\ ===$ ]]; then
+            cur_name="${BASH_REMATCH[1]}"
+            cur_link=""
+        elif [[ "$line" =~ ^链接:\ (.+)$ ]]; then
+            cur_link="${BASH_REMATCH[1]}"
+            if [ -n "$cur_name" ] && [ -n "$cur_link" ]; then
+                names+=("$cur_name")
+                links+=("$cur_link")
+                cur_name=""; cur_link=""
+            fi
+        fi
+    done < "$INFO_FILE"
+
+    if [ ${#names[@]} -eq 0 ]; then
+        return
+    fi
+
+    echo ""
+    echo -e "${CYAN}━━━ 显示二维码 ━━━${NC}"
+    local i=1
+    for n in "${names[@]}"; do
+        echo "  $i) $n"
+        i=$((i + 1))
+    done
+    echo "  a) 全部"
+    echo "  其他/回车) 跳过"
+    echo ""
+    local QR_CHOICE
+    read -rp "  选择要显示二维码的节点: " QR_CHOICE
+
+    case "$QR_CHOICE" in
+        a|A)
+            for idx in "${!names[@]}"; do
+                show_qrcode "${links[$idx]}" "${names[$idx]}"
+            done
+            ;;
+        ''|*[!0-9]*)
+            return
+            ;;
+        *)
+            local sel=$((QR_CHOICE - 1))
+            if [ "$sel" -ge 0 ] && [ "$sel" -lt "${#names[@]}" ]; then
+                show_qrcode "${links[$sel]}" "${names[$sel]}"
+            else
+                echo -e "${RED}编号超出范围${NC}"
+            fi
+            ;;
+    esac
 }
 
-# ========== 流量统计 ==========
+# ========== 流量统计（保持原逻辑，仅敏感文件加权限） ==========
 TRAFFIC_DB="/root/.xray_traffic_db"
-
-# 数据库格式(v2): timestamp|tag|port|cumulative_up|cumulative_down|delta_up|delta_down
-#   - cumulative_*: Xray API 返回的原始累计值（重启会归零）
-#   - delta_*: 相对上一次采样的增量，已处理了计数器归零的情况
-# 旧格式(v1, 5字段)会被 promote_v1_row 兼容地当成 delta=0 处理
 
 setup_traffic_cron() {
     CRON_SCRIPT="/root/.xray_traffic_record.sh"
-    
     cat > "$CRON_SCRIPT" << 'CRONEOF'
 #!/bin/bash
 CONFIG_FILE="/usr/local/etc/xray/config.json"
 TRAFFIC_DB="/root/.xray_traffic_db"
 XRAY_BIN="/usr/local/bin/xray"
-
 [ ! -f "$CONFIG_FILE" ] && exit 0
 command -v xray &>/dev/null || exit 0
 
-CONFIG_FILE="$CONFIG_FILE" \
-TRAFFIC_DB="$TRAFFIC_DB" \
-XRAY_BIN="$XRAY_BIN" \
+CONFIG_FILE="$CONFIG_FILE" TRAFFIC_DB="$TRAFFIC_DB" XRAY_BIN="$XRAY_BIN" \
 python3 << 'PYEOF'
 import json, subprocess, os, time
-
 config_file = os.environ["CONFIG_FILE"]
 db_file = os.environ["TRAFFIC_DB"]
 xray_bin = os.environ["XRAY_BIN"]
 timestamp = int(time.time())
 
-with open(config_file, "r") as f:
+with open(config_file) as f:
     config = json.load(f)
 
 def get_stat(name):
     try:
-        result = subprocess.run(
-            [xray_bin, "api", "stats", "--server=127.0.0.1:10085", f"-name={name}"],
-            capture_output=True, text=True, timeout=5
-        )
+        result = subprocess.run([xray_bin,"api","stats","--server=127.0.0.1:10085",f"-name={name}"],
+                                capture_output=True, text=True, timeout=5)
         for line in result.stdout.strip().split("\n"):
             if "value:" in line.lower():
                 val = line.split(":")[-1].strip()
                 return int(val) if val else 0
-    except Exception:
-        pass
+    except Exception: pass
     return 0
 
-# 读最后一次每个 tag 的累计值，用于计算 delta 并处理计数器归零
 last_cum = {}
 if os.path.exists(db_file):
     try:
-        with open(db_file, "r") as f:
+        with open(db_file) as f:
             for line in f:
                 parts = line.strip().split("|")
-                # v2 格式 7 字段；v1 格式 5 字段（兼容）
                 if len(parts) >= 5:
                     try:
-                        tag = parts[1]
-                        cum_up = int(parts[3])
-                        cum_down = int(parts[4])
-                        last_cum[tag] = (cum_up, cum_down)
-                    except ValueError:
-                        pass
-    except Exception:
-        pass
+                        last_cum[parts[1]] = (int(parts[3]), int(parts[4]))
+                    except ValueError: pass
+    except Exception: pass
 
 new_rows = []
 for inb in config.get("inbounds", []):
     tag = inb.get("tag", "")
-    if tag == "api-in" or not tag:
-        continue
+    if tag == "api-in" or not tag: continue
     port = inb.get("port", 0)
     cur_up = get_stat(f"inbound>>>{tag}>>>traffic>>>uplink")
     cur_down = get_stat(f"inbound>>>{tag}>>>traffic>>>downlink")
-
     prev_up, prev_down = last_cum.get(tag, (0, 0))
-
-    # 计数器归零检测：当前 < 上一次，说明 Xray 重启过，把当前值当成增量
-    if cur_up < prev_up:
-        delta_up = cur_up
-    else:
-        delta_up = cur_up - prev_up
-
-    if cur_down < prev_down:
-        delta_down = cur_down
-    else:
-        delta_down = cur_down - prev_down
-
+    delta_up = cur_up if cur_up < prev_up else cur_up - prev_up
+    delta_down = cur_down if cur_down < prev_down else cur_down - prev_down
     new_rows.append(f"{timestamp}|{tag}|{port}|{cur_up}|{cur_down}|{delta_up}|{delta_down}")
 
-with open(db_file, "a") as f:
+# 用 'a' 模式但创建时设置权限
+fd = os.open(db_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+with os.fdopen(fd, "a") as f:
     for r in new_rows:
         f.write(r + "\n")
 
-# 清理超过 60 天的旧数据
 cutoff = timestamp - 60 * 86400
 if os.path.exists(db_file):
-    with open(db_file, "r") as f:
+    with open(db_file) as f:
         lines = f.readlines()
-    with open(db_file, "w") as f:
+    fd = os.open(db_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         for line in lines:
             parts = line.strip().split("|")
             if len(parts) >= 5:
                 try:
                     if int(parts[0]) > cutoff:
                         f.write(line)
-                except ValueError:
-                    pass
+                except ValueError: pass
 PYEOF
 CRONEOF
 
-    chmod +x "$CRON_SCRIPT"
-    
+    chmod 700 "$CRON_SCRIPT"
     if ! crontab -l 2>/dev/null | grep -q "xray_traffic_record"; then
-        # crontab -l 在从未创建过 crontab 的用户下会返回非零，
-        # 配合外层 set -e 会让子 shell 中断、echo 不执行、最终写入空 crontab。
-        # 必须加 || true 规避。
         (crontab -l 2>/dev/null || true; echo "*/5 * * * * /root/.xray_traffic_record.sh # xray_traffic_record") | crontab -
         echo -e "  ${GREEN}✓ 流量记录定时任务已安装 (每5分钟)${NC}"
     fi
@@ -1022,14 +1363,11 @@ CRONEOF
 
 show_traffic() {
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}未找到配置文件！${NC}"
-        return
+        echo -e "${RED}未找到配置文件！${NC}"; return
     fi
-
     if ! grep -q '"StatsService"' "$CONFIG_FILE" 2>/dev/null; then
         echo -e "${YELLOW}当前配置未启用流量统计 API${NC}"
-        echo -e "${YELLOW}需要重新全新安装(选1)才能使用${NC}"
-        return
+        echo -e "${YELLOW}需要重新全新安装才能使用${NC}"; return
     fi
 
     setup_traffic_cron
@@ -1040,351 +1378,287 @@ show_traffic() {
     echo -e "${CYAN}╚═══════════════════════════════════════════════╝${NC}"
     echo ""
 
-    CONFIG_FILE="$CONFIG_FILE" \
-    TRAFFIC_DB="$TRAFFIC_DB" \
-    XRAY_BIN="/usr/local/bin/xray" \
+    CONFIG_FILE="$CONFIG_FILE" TRAFFIC_DB="$TRAFFIC_DB" XRAY_BIN="/usr/local/bin/xray" \
     python3 << 'PYEOF'
 import json, subprocess, os, time
-
-config_file = os.environ["CONFIG_FILE"]
-db_file = os.environ["TRAFFIC_DB"]
-xray_bin = os.environ["XRAY_BIN"]
-
-with open(config_file, "r") as f:
+config_file = os.environ["CONFIG_FILE"]; db_file = os.environ["TRAFFIC_DB"]; xray_bin = os.environ["XRAY_BIN"]
+with open(config_file) as f:
     config = json.load(f)
 
 def get_stat(name):
     try:
-        result = subprocess.run(
-            [xray_bin, "api", "stats", "--server=127.0.0.1:10085", f"-name={name}"],
-            capture_output=True, text=True, timeout=5
-        )
-        for line in result.stdout.strip().split("\n"):
+        r = subprocess.run([xray_bin,"api","stats","--server=127.0.0.1:10085",f"-name={name}"],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.strip().split("\n"):
             if "value:" in line.lower():
-                val = line.split(":")[-1].strip()
-                return int(val) if val else 0
-    except Exception:
-        pass
+                v = line.split(":")[-1].strip()
+                return int(v) if v else 0
+    except Exception: pass
     return 0
 
-def format_bytes(b):
+def fmt(b):
     b = abs(b)
-    if b < 1024:
-        return f"{b} B"
-    elif b < 1024**2:
-        return f"{b/1024:.1f} KB"
-    elif b < 1024**3:
-        return f"{b/1024**2:.1f} MB"
-    else:
-        return f"{b/1024**3:.2f} GB"
+    if b < 1024: return f"{b} B"
+    if b < 1024**2: return f"{b/1024:.1f} KB"
+    if b < 1024**3: return f"{b/1024**2:.1f} MB"
+    return f"{b/1024**3:.2f} GB"
 
 def get_dest(tag):
-    for rule in config.get("routing", {}).get("rules", []):
+    for rule in config.get("routing",{}).get("rules",[]):
         if rule.get("inboundTag") and tag in rule["inboundTag"]:
-            out_tag = rule.get("outboundTag", "")
-            # 公共出站 direct/block 不挂 servers，特判一下
-            if out_tag == "direct":
-                return "VPS"
-            if out_tag == "block":
-                return "BLOCK"
+            ot = rule.get("outboundTag","")
+            if ot == "direct": return "VPS"
+            if ot == "block": return "BLOCK"
             for ob in config["outbounds"]:
-                if ob.get("tag") == out_tag:
-                    servers = ob.get("settings", {}).get("servers", [])
-                    if servers:
-                        return servers[0]["address"]
+                if ob.get("tag") == ot:
+                    s = ob.get("settings",{}).get("servers",[])
+                    if s: return s[0]["address"]
     return ""
 
-# ===== 当前实时流量（自上次启动，从 API 直接取） =====
 print("  ━━━ 当前实时 (自上次启动) ━━━")
 print(f"  {'节点':<22} {'上行':>10} {'下行':>10} {'合计':>10}")
 print(f"  {'─'*22} {'─'*10} {'─'*10} {'─'*10}")
-
-total_up = 0
-total_down = 0
-
-for inb in config.get("inbounds", []):
-    tag = inb.get("tag", "")
-    if tag == "api-in" or not tag:
-        continue
-    port = inb.get("port", "?")
-    dest = get_dest(tag)
+total_up=0; total_down=0
+for inb in config.get("inbounds",[]):
+    tag = inb.get("tag","");
+    if tag == "api-in" or not tag: continue
+    port = inb.get("port","?"); dest = get_dest(tag)
     up = get_stat(f"inbound>>>{tag}>>>traffic>>>uplink")
     down = get_stat(f"inbound>>>{tag}>>>traffic>>>downlink")
-    total = up + down
-    total_up += up
-    total_down += down
+    total_up += up; total_down += down
     name = f":{port}→{dest}" if dest else f":{port}"
-    print(f"  {name:<22} {format_bytes(up):>10} {format_bytes(down):>10} {format_bytes(total):>10}")
-
+    print(f"  {name:<22} {fmt(up):>10} {fmt(down):>10} {fmt(up+down):>10}")
 print(f"  {'─'*22} {'─'*10} {'─'*10} {'─'*10}")
-print(f"  {'总计':<22} {format_bytes(total_up):>10} {format_bytes(total_down):>10} {format_bytes(total_up+total_down):>10}")
+print(f"  {'总计':<22} {fmt(total_up):>10} {fmt(total_down):>10} {fmt(total_up+total_down):>10}")
 
-# ===== 历史流量统计 =====
 if not os.path.exists(db_file):
     print("\n  历史数据尚未积累，请等待5分钟后再查看")
 else:
-    # 读取所有记录; 每行: ts|tag|port|cum_up|cum_down|delta_up|delta_down
-    # v1 旧格式（5 字段）: delta_up/delta_down 视作 0 跳过，不影响正确性
     records = []
-    with open(db_file, "r") as f:
+    with open(db_file) as f:
         for line in f:
             parts = line.strip().split("|")
             if len(parts) >= 7:
                 try:
-                    ts = int(parts[0])
-                    tag = parts[1]
-                    port = int(parts[2])
-                    delta_up = int(parts[5])
-                    delta_down = int(parts[6])
-                    records.append((ts, tag, port, delta_up, delta_down))
-                except ValueError:
-                    pass
-
+                    records.append((int(parts[0]), parts[1], int(parts[2]), int(parts[5]), int(parts[6])))
+                except ValueError: pass
     if records:
         now = int(time.time())
-        periods = [
-            ("过去1小时", now - 3600),
-            ("今天", now - (now % 86400)),
-            ("过去7天", now - 7 * 86400),
-            ("过去30天", now - 30 * 86400),
-        ]
-
+        periods = [("过去1小时", now-3600), ("今天", now-(now%86400)),
+                   ("过去7天", now-7*86400), ("过去30天", now-30*86400)]
         tags = sorted({(r[1], r[2]) for r in records}, key=lambda x: x[1])
-
-        for period_name, since in periods:
-            print(f"\n  ━━━ {period_name} ━━━")
+        for pn, since in periods:
+            print(f"\n  ━━━ {pn} ━━━")
             print(f"  {'节点':<22} {'上行':>10} {'下行':>10} {'合计':>10}")
             print(f"  {'─'*22} {'─'*10} {'─'*10} {'─'*10}")
-
-            p_total_up = 0
-            p_total_down = 0
-
+            tu=0; td=0
             for tag, port in tags:
-                # 增量法：区间内所有 delta 之和即为该段实际流量
-                # Xray 重启时 record.sh 已把重启后的当前值作为 delta 写入
-                up = sum(r[3] for r in records if r[1] == tag and r[0] >= since)
-                down = sum(r[4] for r in records if r[1] == tag and r[0] >= since)
-                total = up + down
-                p_total_up += up
-                p_total_down += down
-                dest = get_dest(tag)
-                name = f":{port}→{dest}" if dest else f":{port}"
-                print(f"  {name:<22} {format_bytes(up):>10} {format_bytes(down):>10} {format_bytes(total):>10}")
-
+                u = sum(r[3] for r in records if r[1]==tag and r[0]>=since)
+                d = sum(r[4] for r in records if r[1]==tag and r[0]>=since)
+                tu+=u; td+=d
+                dest = get_dest(tag); name = f":{port}→{dest}" if dest else f":{port}"
+                print(f"  {name:<22} {fmt(u):>10} {fmt(d):>10} {fmt(u+d):>10}")
             print(f"  {'─'*22} {'─'*10} {'─'*10} {'─'*10}")
-            print(f"  {'总计':<22} {format_bytes(p_total_up):>10} {format_bytes(p_total_down):>10} {format_bytes(p_total_up+p_total_down):>10}")
+            print(f"  {'总计':<22} {fmt(tu):>10} {fmt(td):>10} {fmt(tu+td):>10}")
 PYEOF
 
     echo ""
-    echo -e "${YELLOW}流量每5分钟自动记录一次，历史数据保留60天${NC}"
-    echo ""
+    echo -e "${YELLOW}流量每5分钟自动记录，历史保留60天${NC}"
     echo "  r) 重置当前计数"
     echo "  c) 清除历史数据"
     echo "  其他) 返回"
-    read -p "  选择: " ACTION
+    read -rp "  选择: " ACTION
     case $ACTION in
-        r)
-            xray api stats --server=127.0.0.1:10085 -reset 2>/dev/null
-            echo -e "${GREEN}✓ 当前计数已重置${NC}"
-            ;;
-        c)
-            rm -f "$TRAFFIC_DB"
-            echo -e "${GREEN}✓ 历史数据已清除${NC}"
-            ;;
+        r) xray api stats --server=127.0.0.1:10085 -reset 2>/dev/null
+           echo -e "${GREEN}✓ 当前计数已重置${NC}";;
+        c) rm -f "$TRAFFIC_DB"; echo -e "${GREEN}✓ 历史数据已清除${NC}";;
     esac
 }
 
+# ========== 修改端口（带原子写入 + 编号无效不重启） ==========
 change_port() {
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}未找到配置文件！${NC}"
-        return
+        echo -e "${RED}未找到配置文件！${NC}"; return
     fi
 
     echo -e "${GREEN}[修改端口]${NC}"
     echo "当前节点端口:"
     python3 << 'PYEOF'
 import json
-with open("/usr/local/etc/xray/config.json", "r") as f:
+with open("/usr/local/etc/xray/config.json") as f:
     config = json.load(f)
 display_idx = 0
 for inb in config["inbounds"]:
-    if inb.get("tag") == "api-in":
-        continue
+    if inb.get("tag") == "api-in": continue
     display_idx += 1
-    tag = inb.get("tag", "unknown")
-    port = inb.get("port", "?")
+    tag = inb.get("tag","unknown"); port = inb.get("port","?")
     out_tag = None
-    for rule in config.get("routing", {}).get("rules", []):
+    for rule in config.get("routing",{}).get("rules",[]):
         if rule.get("inboundTag") and tag in rule["inboundTag"]:
-            out_tag = rule.get("outboundTag")
-            break
+            out_tag = rule.get("outboundTag"); break
     dest = ""
-    if out_tag == "direct":
-        dest = " → VPS 直连"
+    if out_tag == "direct": dest = " → VPS 直连"
     elif out_tag:
         for ob in config["outbounds"]:
             if ob.get("tag") == out_tag:
-                servers = ob.get("settings", {}).get("servers", [])
-                if servers:
-                    dest = f" → {servers[0]['address']}:{servers[0]['port']}"
+                s = ob.get("settings",{}).get("servers",[])
+                if s: dest = f" → {s[0]['address']}:{s[0]['port']}"
                 break
     print(f"  {display_idx}) 端口 {port}{dest} [{tag}]")
 PYEOF
 
     echo ""
-    read -p "选择要修改的节点编号: " IDX
-    read -p "新端口号: " NEW_PORT
-
+    local IDX NEW_PORT
+    read -rp "选择要修改的节点编号: " IDX
+    read -rp "新端口号: " NEW_PORT
     if [ -z "$IDX" ] || [ -z "$NEW_PORT" ]; then
-        echo -e "${RED}输入不能为空${NC}"
-        return
+        echo -e "${RED}输入不能为空${NC}"; return
     fi
-
+    if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
+        echo -e "${RED}端口必须是 1-65535 的整数${NC}"; return
+    fi
     if port_in_use "$NEW_PORT"; then
-        echo -e "${RED}端口 ${NEW_PORT} 已被占用，请换一个端口${NC}"
-        return
+        echo -e "${RED}端口 ${NEW_PORT} 已被占用${NC}"; return
     fi
 
-    CONFIG_FILE="$CONFIG_FILE" IDX="$IDX" NEW_PORT="$NEW_PORT" python3 << 'PYEOF'
-import json
-import os
+    local NEW_CONFIG="/tmp/.xray_config.new.$$.json"
+    cp -a "$CONFIG_FILE" "$NEW_CONFIG"
 
-config_file = os.environ["CONFIG_FILE"]
-idx = int(os.environ["IDX"]) - 1
+    # 关键：Python 在编号无效时退出码 2，外层捕获后 return，不再走 firewall / restart
+    if ! NEW_CONFIG_FILE="$NEW_CONFIG" IDX="$IDX" NEW_PORT="$NEW_PORT" python3 << 'PYEOF'
+import json, os, sys
+new_config = os.environ["NEW_CONFIG_FILE"]
+try:
+    idx = int(os.environ["IDX"]) - 1
+except ValueError:
+    print("编号必须是整数"); sys.exit(2)
 new_port = int(os.environ["NEW_PORT"])
 
-with open(config_file, "r") as f:
+with open(new_config) as f:
     config = json.load(f)
+business = [inb for inb in config["inbounds"] if inb.get("tag") != "api-in"]
+if not (0 <= idx < len(business)):
+    print(f"编号无效（应在 1-{len(business)} 之间）"); sys.exit(2)
 
-business_inbounds = [inb for inb in config["inbounds"] if inb.get("tag") != "api-in"]
-
-if 0 <= idx < len(business_inbounds):
-    target_tag = business_inbounds[idx]["tag"]
-    old_port = business_inbounds[idx]["port"]
-    for inb in config["inbounds"]:
-        if inb.get("tag") == target_tag:
-            inb["port"] = new_port
-            break
-    with open(config_file, "w") as f:
-        json.dump(config, f, indent=4)
-    print(f"端口已从 {old_port} 修改为 {new_port}")
-else:
-    print("编号无效")
+target = business[idx]["tag"]; old = business[idx]["port"]
+for inb in config["inbounds"]:
+    if inb.get("tag") == target:
+        inb["port"] = new_port; break
+with open(new_config, "w") as f:
+    json.dump(config, f, indent=4)
+print(f"端口已从 {old} 修改为 {new_port}")
 PYEOF
+    then
+        echo -e "${RED}✗ 修改取消（编号无效或参数错误），原配置保持不变${NC}"
+        rm -f "$NEW_CONFIG"
+        return
+    fi
 
-    apply_firewall_port "$NEW_PORT"
+    if ! validate_and_install_config "$NEW_CONFIG"; then
+        echo -e "${RED}配置校验失败，已保留原配置${NC}"; return
+    fi
 
-    systemctl restart xray
-    sleep 1
-
-    if systemctl is-active --quiet xray; then
-        echo -e "${GREEN}✓ 端口修改成功，Xray 已重启${NC}"
+    apply_firewall_port_capture "$NEW_PORT"
+    if restart_with_rollback; then
+        echo -e "${GREEN}✓ 端口修改成功${NC}"
+        echo -e "  $(format_fw_status)"
         VPS_IP=$(get_ip)
         load_node_identity
         PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
         NEW_LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Port-${NEW_PORT}"
-        echo -e "${YELLOW}新链接:${NC}"
-        echo -e "${NEW_LINK}"
-
+        echo -e "${YELLOW}新链接:${NC} ${NEW_LINK}"
         show_qrcode "$NEW_LINK" "Port-${NEW_PORT}"
-    else
-        echo -e "${RED}重启失败: journalctl -u xray -n 20${NC}"
     fi
 }
 
+# ========== 删除节点（同样的安全模式）==========
 delete_node() {
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}未找到配置文件！${NC}"
-        return
+        echo -e "${RED}未找到配置文件！${NC}"; return
     fi
-
     echo -e "${GREEN}[删除节点]${NC}"
     echo "当前节点:"
     python3 << 'PYEOF'
 import json
-with open("/usr/local/etc/xray/config.json", "r") as f:
+with open("/usr/local/etc/xray/config.json") as f:
     config = json.load(f)
-display_idx = 0
+i = 0
 for inb in config["inbounds"]:
-    if inb.get("tag") == "api-in":
-        continue
-    display_idx += 1
-    tag = inb.get("tag", "unknown")
-    port = inb.get("port", "?")
+    if inb.get("tag") == "api-in": continue
+    i += 1
+    tag = inb.get("tag","unknown"); port = inb.get("port","?")
     out_tag = None
-    for rule in config.get("routing", {}).get("rules", []):
+    for rule in config.get("routing",{}).get("rules",[]):
         if rule.get("inboundTag") and tag in rule["inboundTag"]:
-            out_tag = rule.get("outboundTag")
-            break
+            out_tag = rule.get("outboundTag"); break
     dest = ""
-    if out_tag == "direct":
-        dest = " → VPS 直连"
+    if out_tag == "direct": dest = " → VPS 直连"
     elif out_tag:
         for ob in config["outbounds"]:
             if ob.get("tag") == out_tag:
-                servers = ob.get("settings", {}).get("servers", [])
-                if servers:
-                    dest = f" → {servers[0]['address']}:{servers[0]['port']}"
+                s = ob.get("settings",{}).get("servers",[])
+                if s: dest = f" → {s[0]['address']}:{s[0]['port']}"
                 break
-    print(f"  {display_idx}) 端口 {port}{dest} [{tag}]")
+    print(f"  {i}) 端口 {port}{dest} [{tag}]")
 PYEOF
 
     echo ""
-    read -p "选择要删除的节点编号: " IDX
-
+    local IDX
+    read -rp "选择要删除的节点编号: " IDX
     if [ -z "$IDX" ]; then
-        echo -e "${RED}输入不能为空${NC}"
+        echo -e "${RED}输入不能为空${NC}"; return
+    fi
+
+    local NEW_CONFIG="/tmp/.xray_config.new.$$.json"
+    cp -a "$CONFIG_FILE" "$NEW_CONFIG"
+
+    if ! NEW_CONFIG_FILE="$NEW_CONFIG" IDX="$IDX" python3 << 'PYEOF'
+import json, os, sys
+new_config = os.environ["NEW_CONFIG_FILE"]
+try:
+    idx = int(os.environ["IDX"]) - 1
+except ValueError:
+    print("编号必须是整数"); sys.exit(2)
+
+with open(new_config) as f:
+    config = json.load(f)
+business = [inb for inb in config["inbounds"] if inb.get("tag") != "api-in"]
+if not (0 <= idx < len(business)):
+    print(f"编号无效（应在 1-{len(business)} 之间）"); sys.exit(2)
+
+tag = business[idx]["tag"]; port = business[idx]["port"]
+config["inbounds"] = [inb for inb in config["inbounds"] if inb.get("tag") != tag]
+out_tag = None; new_rules = []
+for r in config["routing"]["rules"]:
+    inb_tags = r.get("inboundTag", [])
+    if inb_tags and tag in inb_tags:
+        out_tag = r.get("outboundTag")
+    else:
+        new_rules.append(r)
+config["routing"]["rules"] = new_rules
+
+if out_tag and out_tag not in ("direct","block"):
+    # 仅当没有其他规则引用此 outbound 时才删除（防止共享 outbound 被误删）
+    still_used = any(out_tag in (r.get("outboundTag") or "") for r in config["routing"]["rules"])
+    if not still_used:
+        config["outbounds"] = [o for o in config["outbounds"] if o.get("tag") != out_tag]
+
+with open(new_config, "w") as f:
+    json.dump(config, f, indent=4)
+print(f"已删除: 端口 {port} [{tag}]")
+PYEOF
+    then
+        echo -e "${RED}✗ 删除取消（编号无效），原配置保持不变${NC}"
+        rm -f "$NEW_CONFIG"
         return
     fi
 
-    CONFIG_FILE="$CONFIG_FILE" IDX="$IDX" python3 << 'PYEOF'
-import json
-import os
+    if ! validate_and_install_config "$NEW_CONFIG"; then
+        echo -e "${RED}配置校验失败，已保留原配置${NC}"; return
+    fi
 
-config_file = os.environ["CONFIG_FILE"]
-idx = int(os.environ["IDX"]) - 1
-
-with open(config_file, "r") as f:
-    config = json.load(f)
-
-business_inbounds = [inb for inb in config["inbounds"] if inb.get("tag") != "api-in"]
-
-if 0 <= idx < len(business_inbounds):
-    tag = business_inbounds[idx]["tag"]
-    port = business_inbounds[idx]["port"]
-    config["inbounds"] = [inb for inb in config["inbounds"] if inb.get("tag") != tag]
-
-    out_tag = None
-    new_rules = []
-    for r in config["routing"]["rules"]:
-        inbound_tags = r.get("inboundTag", [])
-        if inbound_tags and tag in inbound_tags:
-            out_tag = r.get("outboundTag")
-        else:
-            new_rules.append(r)
-    config["routing"]["rules"] = new_rules
-
-    if out_tag:
-        # 保护公共出站：direct（VPS 直连）和 block（黑洞）是所有节点共享的，不能随节点删除
-        # 注意：本脚本假设每个业务 inbound 绑定独占的 outbound（socks5-out-N）。
-        # 若手动改过 config.json 让多个 inbound 共享同一个 socks5-out-X，此处删除会连带断开它们。
-        if out_tag not in ("direct", "block"):
-            config["outbounds"] = [o for o in config["outbounds"] if o.get("tag") != out_tag]
-
-    with open(config_file, "w") as f:
-        json.dump(config, f, indent=4)
-    print(f"已删除: 端口 {port} [{tag}]")
-else:
-    print("编号无效")
-PYEOF
-
-    systemctl restart xray
-    sleep 1
-
-    if systemctl is-active --quiet xray; then
-        echo -e "${GREEN}✓ 节点已删除，Xray 已重启${NC}"
-    else
-        echo -e "${RED}重启失败: journalctl -u xray -n 20${NC}"
+    if restart_with_rollback; then
+        echo -e "${GREEN}✓ 节点已删除${NC}"
     fi
 }
 
@@ -1393,16 +1667,13 @@ troubleshoot() {
     echo -e "${CYAN}║              排错诊断                         ║${NC}"
     echo -e "${CYAN}╚═══════════════════════════════════════════════╝${NC}"
     echo ""
-
     ERRORS=0
 
     echo -e "${GREEN}[1/8] Xray 服务状态${NC}"
     if systemctl is-active --quiet xray; then
         echo -e "  ${GREEN}✓ Xray 正在运行${NC}"
     else
-        echo -e "  ${RED}✗ Xray 未运行${NC}"
-        ERRORS=$((ERRORS + 1))
-        echo -e "  ${YELLOW}最近日志:${NC}"
+        echo -e "  ${RED}✗ Xray 未运行${NC}"; ERRORS=$((ERRORS+1))
         journalctl -u xray -n 10 --no-pager 2>/dev/null | sed 's/^/    /'
     fi
 
@@ -1413,30 +1684,22 @@ troubleshoot() {
         if python3 -c "import json; json.load(open('$CONFIG_FILE'))" 2>/dev/null; then
             echo -e "  ${GREEN}✓ JSON 格式正确${NC}"
         else
-            echo -e "  ${RED}✗ JSON 格式错误${NC}"
-            ERRORS=$((ERRORS + 1))
-            echo -e "  ${YELLOW}尝试: python3 -m json.tool $CONFIG_FILE${NC}"
+            echo -e "  ${RED}✗ JSON 格式错误${NC}"; ERRORS=$((ERRORS+1))
         fi
-        # 用 Python 解析检查 privateKey，避免 grep 对 JSON 空格格式敏感
         if python3 -c "
-import json, sys
-with open('$CONFIG_FILE') as f:
-    cfg = json.load(f)
-for inb in cfg.get('inbounds', []):
-    if inb.get('tag') == 'api-in':
-        continue
-    pk = inb.get('streamSettings', {}).get('realitySettings', {}).get('privateKey', '')
-    if not pk:
-        sys.exit(1)
+import json,sys
+cfg = json.load(open('$CONFIG_FILE'))
+for inb in cfg.get('inbounds',[]):
+    if inb.get('tag') == 'api-in': continue
+    pk = inb.get('streamSettings',{}).get('realitySettings',{}).get('privateKey','')
+    if not pk: sys.exit(1)
 " 2>/dev/null; then
             echo -e "  ${GREEN}✓ privateKey 已配置${NC}"
         else
-            echo -e "  ${RED}✗ privateKey 为空或缺失${NC}"
-            ERRORS=$((ERRORS + 1))
+            echo -e "  ${RED}✗ privateKey 为空或缺失${NC}"; ERRORS=$((ERRORS+1))
         fi
     else
-        echo -e "  ${RED}✗ 配置文件不存在${NC}"
-        ERRORS=$((ERRORS + 1))
+        echo -e "  ${RED}✗ 配置文件不存在${NC}"; ERRORS=$((ERRORS+1))
     fi
 
     echo ""
@@ -1444,17 +1707,14 @@ for inb in cfg.get('inbounds', []):
     if [ -f "$CONFIG_FILE" ]; then
         PORTS=$(python3 -c "
 import json
-with open('$CONFIG_FILE') as f:
-    config=json.load(f)
-for inb in config.get('inbounds',[]):
-    print(inb.get('port',''))
-" 2>/dev/null)
+cfg = json.load(open('$CONFIG_FILE'))
+for inb in cfg.get('inbounds',[]):
+    print(inb.get('port',''))" 2>/dev/null)
         for PORT in $PORTS; do
             if ss -tlnp | grep -q ":${PORT} "; then
                 echo -e "  ${GREEN}✓ 端口 ${PORT} 正在监听${NC}"
             else
-                echo -e "  ${RED}✗ 端口 ${PORT} 未监听${NC}"
-                ERRORS=$((ERRORS + 1))
+                echo -e "  ${RED}✗ 端口 ${PORT} 未监听${NC}"; ERRORS=$((ERRORS+1))
             fi
         done
     fi
@@ -1476,7 +1736,6 @@ for inb in config.get('inbounds',[]):
     elif command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null; then
         echo -e "  firewalld: 运行中"
         if [ -f "$CONFIG_FILE" ]; then
-            # set -e 下赋值语句里的命令失败会直接杀脚本
             OPEN_PORTS=$(firewall-cmd --list-ports 2>/dev/null || true)
             for PORT in $PORTS; do
                 if echo "$OPEN_PORTS" | grep -q "${PORT}/tcp"; then
@@ -1487,7 +1746,7 @@ for inb in config.get('inbounds',[]):
             done
         fi
     else
-        echo -e "  未检测到 UFW 或 firewalld，跳过（使用 iptables 兜底）"
+        echo -e "  未检测到 UFW / firewalld（使用 iptables 或 nftables 兜底）"
     fi
 
     echo ""
@@ -1495,120 +1754,76 @@ for inb in config.get('inbounds',[]):
     if [ -f "$CONFIG_FILE" ]; then
         python3 << 'PYEOF'
 import json, socket
-
-with open("/usr/local/etc/xray/config.json", "r") as f:
+with open("/usr/local/etc/xray/config.json") as f:
     config = json.load(f)
-
 for ob in config["outbounds"]:
     if ob.get("protocol") == "socks":
-        servers = ob.get("settings", {}).get("servers", [])
-        for s in servers:
-            addr = s["address"]
-            port = s["port"]
-            tag = ob.get("tag", "unknown")
+        for s in ob.get("settings",{}).get("servers",[]):
             try:
-                sock = socket.create_connection((addr, port), timeout=5)
+                sock = socket.create_connection((s["address"], s["port"]), timeout=5)
                 sock.close()
-                print(f"  ✓ {addr}:{port} [{tag}] 连通")
+                print(f"  ✓ {s['address']}:{s['port']} [{ob.get('tag','?')}] 连通")
             except Exception as e:
-                print(f"  ✗ {addr}:{port} [{tag}] 不通 - {e}")
+                print(f"  ✗ {s['address']}:{s['port']} [{ob.get('tag','?')}] 不通 - {e}")
 PYEOF
     fi
 
     echo ""
     echo -e "${GREEN}[6/8] BBR 状态${NC}"
     BBR=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    if [ "$BBR" = "bbr" ]; then
-        echo -e "  ${GREEN}✓ BBR 已启用${NC}"
-    else
-        echo -e "  ${RED}✗ BBR 未启用 (当前: ${BBR})${NC}"
-        ERRORS=$((ERRORS + 1))
-    fi
+    if [ "$BBR" = "bbr" ]; then echo -e "  ${GREEN}✓ BBR 已启用${NC}"
+    else echo -e "  ${RED}✗ BBR 未启用 (当前: ${BBR})${NC}"; ERRORS=$((ERRORS+1)); fi
 
     echo ""
     echo -e "${GREEN}[7/8] 系统资源${NC}"
     MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
     MEM_USED=$(free -m | awk '/Mem:/ {print $3}')
-    if [ "${MEM_TOTAL:-0}" -gt 0 ]; then
-        MEM_PERCENT=$((MEM_USED * 100 / MEM_TOTAL))
-    else
-        MEM_PERCENT=0
-    fi
+    MEM_PERCENT=$([ "${MEM_TOTAL:-0}" -gt 0 ] && echo $((MEM_USED * 100 / MEM_TOTAL)) || echo 0)
     DISK_PERCENT=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
     CPU_LOAD=$(uptime | awk -F'load average:' '{print $2}' | awk '{print $1}' | tr -d ',')
-
     echo -e "  内存: ${MEM_USED}MB / ${MEM_TOTAL}MB (${MEM_PERCENT}%)"
-    if [ "$MEM_PERCENT" -gt 90 ]; then
-        echo -e "  ${RED}⚠ 内存使用率过高！${NC}"
-        ERRORS=$((ERRORS + 1))
-    fi
+    [ "$MEM_PERCENT" -gt 90 ] && { echo -e "  ${RED}⚠ 内存使用率过高！${NC}"; ERRORS=$((ERRORS+1)); }
     echo -e "  磁盘: ${DISK_PERCENT}% 已用"
-    if [ "$DISK_PERCENT" -gt 90 ]; then
-        echo -e "  ${RED}⚠ 磁盘空间不足！${NC}"
-        ERRORS=$((ERRORS + 1))
-    fi
+    [ "$DISK_PERCENT" -gt 90 ] && { echo -e "  ${RED}⚠ 磁盘空间不足！${NC}"; ERRORS=$((ERRORS+1)); }
     echo -e "  负载: ${CPU_LOAD}"
 
     echo ""
     echo -e "${GREEN}[8/8] 最近错误日志${NC}"
-    RECENT_ERRORS=$(journalctl -u xray --since "1 hour ago" --no-pager 2>/dev/null | grep -i -E "error|fail|refused" | tail -5)
-    if [ -n "$RECENT_ERRORS" ]; then
-        echo -e "  ${YELLOW}发现以下错误:${NC}"
-        echo "$RECENT_ERRORS" | sed 's/^/    /'
+    RECENT=$(journalctl -u xray --since "1 hour ago" --no-pager 2>/dev/null | grep -i -E "error|fail|refused" | tail -5)
+    if [ -n "$RECENT" ]; then
+        echo -e "  ${YELLOW}发现错误:${NC}"
+        echo "$RECENT" | sed 's/^/    /'
     else
         echo -e "  ${GREEN}✓ 最近1小时无错误${NC}"
     fi
 
     echo ""
     echo -e "${CYAN}━━━ 诊断总结 ━━━${NC}"
-    if [ $ERRORS -eq 0 ]; then
-        echo -e "${GREEN}✓ 所有检查通过，未发现问题${NC}"
-    else
-        echo -e "${RED}发现 ${ERRORS} 个问题，请根据上方提示修复${NC}"
-    fi
+    if [ $ERRORS -eq 0 ]; then echo -e "${GREEN}✓ 所有检查通过${NC}"
+    else echo -e "${RED}发现 ${ERRORS} 个问题${NC}"; fi
     echo ""
 }
 
 uninstall() {
-    read -p "确认卸载 Xray？(y/n): " CONFIRM
+    read -rp "确认卸载 Xray？(y/n): " CONFIRM
     if [ "$CONFIRM" = "y" ]; then
-        # 停止并禁用所有相关服务（set -e 下必须加 || true，
-        # 否则遇到不存在的服务 systemctl 返回非零会直接中断清理流程）
         systemctl stop xray 2>/dev/null || true
         systemctl disable xray 2>/dev/null || true
         systemctl stop xray-monitor.timer 2>/dev/null || true
         systemctl disable xray-monitor.timer 2>/dev/null || true
-
-        # 卸载 Xray 主体（下载失败就跳过远程卸载，本地文件清理照旧继续）
-        run_xray_installer remove || echo -e "${YELLOW}⚠ 官方卸载脚本无法运行，将仅清理本地文件${NC}"
-
-        # 清理监控相关 systemd 单元
-        rm -f /etc/systemd/system/xray-monitor.service
-        rm -f /etc/systemd/system/xray-monitor.timer
+        run_xray_installer remove || echo -e "${YELLOW}⚠ 远程卸载脚本无法运行，仅清理本地${NC}"
+        rm -f /etc/systemd/system/xray-monitor.service /etc/systemd/system/xray-monitor.timer
         rm -rf /etc/systemd/system/xray.service.d
         systemctl daemon-reload 2>/dev/null || true
-
-        # 清理流量记录 cron（crontab -l 在没 crontab 的情况下会失败）
         (crontab -l 2>/dev/null || true) | grep -v "xray_traffic_record" | crontab - 2>/dev/null || true
-
-        # 清理各类数据/配置文件
-        rm -f "$INFO_FILE"
-        rm -f "$SYSCTL_FILE"
-        rm -f /root/.xray_traffic_db
-        rm -f /root/.xray_traffic_record.sh
-        rm -f /root/.xray_monitor.conf
-        rm -f /root/.xray_monitor.sh
-        rm -f /root/.xray_vps_ip
-        rm -f /root/.msmtprc
-        rm -f /tmp/.xray_node_failures
-        rm -f /tmp/.xray_alert_lock_*
-
-        # 应用 sysctl 清除（避免 BBR 参数残留影响其他服务诊断时混淆）
+        rm -f "$INFO_FILE" "$SYSCTL_FILE" /root/.xray_traffic_db /root/.xray_traffic_record.sh \
+              /root/.xray_monitor.conf /root/.xray_monitor.sh /root/.xray_vps_ip /root/.msmtprc \
+              /tmp/.xray_node_failures /tmp/.xray_alert_lock_*
+        # 配置备份保留，让用户决定是否清理
+        echo -e "${YELLOW}注意：配置备份 ${CONFIG_FILE}.bak.* 已保留，如需清理请手动删除${NC}"
         sysctl --system >/dev/null 2>&1 || true
-
-        # 询问是否清理 swapfile
         if [ -f /swapfile ]; then
-            read -p "是否同时移除 /swapfile（1G swap）？(y/n): " RM_SWAP
+            read -rp "是否同时移除 /swapfile？(y/n): " RM_SWAP
             if [ "$RM_SWAP" = "y" ]; then
                 swapoff /swapfile 2>/dev/null || true
                 rm -f /swapfile
@@ -1616,52 +1831,30 @@ uninstall() {
                 echo -e "${GREEN}✓ swapfile 已移除${NC}"
             fi
         fi
-
         echo -e "${GREEN}已完整卸载${NC}"
     fi
 }
 
 update_xray() {
     echo -e "${GREEN}[更新 Xray]${NC}"
-    
     if command -v xray &>/dev/null; then
-        CURRENT=$(xray version 2>/dev/null | head -1)
-        echo -e "  当前版本: ${YELLOW}${CURRENT}${NC}"
+        echo -e "  当前版本: ${YELLOW}$(xray version 2>/dev/null | head -1)${NC}"
     else
-        echo -e "  ${RED}Xray 未安装${NC}"
-        return
+        echo -e "  ${RED}Xray 未安装${NC}"; return
     fi
 
-    echo "  正在检查最新版本..."
     LATEST=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-    
-    if [ -n "$LATEST" ]; then
-        echo -e "  最新版本: ${YELLOW}${LATEST}${NC}"
-    else
-        echo -e "  ${YELLOW}无法获取最新版本号，将直接更新${NC}"
-    fi
+    [ -n "$LATEST" ] && echo -e "  最新版本: ${YELLOW}${LATEST}${NC}" || echo -e "  ${YELLOW}无法获取最新版本号${NC}"
 
-    echo ""
-    read -p "确认更新？(y/n): " CONFIRM
-    if [ "$CONFIRM" != "y" ]; then
-        echo "已取消"
-        return
-    fi
+    read -rp "确认更新？(y/n): " CONFIRM
+    [ "$CONFIRM" != "y" ] && { echo "已取消"; return; }
 
     if ! run_xray_installer install; then
-        echo -e "${RED}更新中止：无法下载安装脚本，现有 Xray 保持不变${NC}"
-        return
+        echo -e "${RED}更新中止：无法下载安装脚本${NC}"; return
     fi
 
-    systemctl restart xray
-    sleep 2
-
-    if systemctl is-active --quiet xray; then
-        NEW_VER=$(xray version 2>/dev/null | head -1)
-        echo -e "${GREEN}✓ 更新成功: ${NEW_VER}${NC}"
-        echo -e "${GREEN}✓ Xray 已重启，配置不变${NC}"
-    else
-        echo -e "${RED}✗ 更新后启动失败，查看日志: journalctl -u xray -n 20${NC}"
+    if restart_with_rollback; then
+        echo -e "${GREEN}✓ 更新成功: $(xray version 2>/dev/null | head -1)${NC}"
     fi
 }
 
@@ -1670,67 +1863,102 @@ MONITOR_CONF="/root/.xray_monitor.conf"
 MONITOR_SCRIPT="/root/.xray_monitor.sh"
 MONITOR_LOG="/var/log/xray/monitor.log"
 
-# 构造符合 SMTP 规范的邮件内容（使用 \r\n 作为行分隔符）
 build_mail() {
-    local subject="$1"
-    local body="$2"
-    local from="$3"
-    local to="$4"
+    local subject="$1" body="$2" from="$3" to="$4"
     printf "Subject: %s\r\nFrom: %s\r\nTo: %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s" \
         "$subject" "$from" "$to" "$body"
 }
 
 setup_mail() {
     echo -e "${GREEN}[配置邮件通知]${NC}"
-    echo ""
-
     if ! command -v msmtp &>/dev/null; then
-        echo "正在安装邮件发送工具..."
-        if command -v apt &>/dev/null; then
-            apt update -y && apt install -y msmtp msmtp-mta
-        elif command -v dnf &>/dev/null; then
-            dnf install -y msmtp
-        elif command -v yum &>/dev/null; then
-            yum install -y msmtp
-        else
-            echo -e "${RED}未检测到支持的包管理器 (apt/dnf/yum)，请手动安装 msmtp${NC}"
-            return 1
+        echo "正在安装 msmtp..."
+        if command -v apt &>/dev/null; then apt update -y && apt install -y msmtp msmtp-mta
+        elif command -v dnf &>/dev/null; then dnf install -y msmtp
+        elif command -v yum &>/dev/null; then yum install -y msmtp
+        else echo -e "${RED}请手动安装 msmtp${NC}"; return 1
         fi
     fi
 
-    echo -e "${CYAN}支持 Gmail / QQ邮箱 / 163邮箱 等${NC}"
-    echo ""
-    read -p "SMTP 服务器 (如 smtp.gmail.com / smtp.qq.com): " SMTP_HOST
-    read -p "SMTP 端口 (通常 587 或 465): " SMTP_PORT
-    read -p "发件邮箱: " MAIL_FROM
-    read -sp "邮箱密码/授权码: " MAIL_PASS
-    echo ""
-    read -p "收件邮箱 (报警发到哪): " MAIL_TO
+    echo -e "${CYAN}支持 Gmail / QQ邮箱 / 163 等${NC}"
+    local SMTP_HOST SMTP_PORT MAIL_FROM MAIL_PASS MAIL_TO
+    read -rp "SMTP 服务器: " SMTP_HOST
+    read -rp "SMTP 端口 (587/465): " SMTP_PORT
+    read -rp "发件邮箱: " MAIL_FROM
+    read -rsp "邮箱密码/授权码: " MAIL_PASS; echo
+    read -rp "收件邮箱: " MAIL_TO
 
-    TLS_TYPE="on"
-    TLS_STARTTLS="on"
-    if [ "$SMTP_PORT" = "465" ]; then
-        TLS_TYPE="on"
-        TLS_STARTTLS="off"
+    # 拒绝任何控制字符（\n \r \t 以及其他 0x00-0x1F）
+    # msmtprc 是行式格式，不支持引号转义；含控制字符会破坏配置
+    local v
+    for v in "$SMTP_HOST" "$SMTP_PORT" "$MAIL_FROM" "$MAIL_PASS" "$MAIL_TO"; do
+        if [[ "$v" =~ [[:cntrl:]] ]]; then
+            echo -e "${RED}✗ 输入不能包含控制字符（换行/Tab/回车等）${NC}"
+            return 1
+        fi
+    done
+    # 端口必须是数字
+    if ! [[ "$SMTP_PORT" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}✗ SMTP 端口必须是纯数字${NC}"; return 1
+    fi
+    # 邮箱地址简单格式（msmtp 不会做严格检查，但避免明显错误）
+    if [[ ! "$MAIL_FROM" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+        echo -e "${RED}✗ 发件邮箱格式可疑: $MAIL_FROM${NC}"; return 1
+    fi
+    if [[ ! "$MAIL_TO" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+        echo -e "${RED}✗ 收件邮箱格式可疑: $MAIL_TO${NC}"; return 1
     fi
 
-    cat > /root/.msmtprc << EOF
-defaults
+    # 用 Python 安全写入 .msmtprc，并在 Python 端再做一道控制字符防御
+    SMTP_HOST="$SMTP_HOST" SMTP_PORT="$SMTP_PORT" \
+    MAIL_FROM="$MAIL_FROM" MAIL_PASS="$MAIL_PASS" \
+    python3 << 'PYEOF' || { echo -e "${RED}✗ msmtprc 写入失败${NC}"; return 1; }
+import os, sys, re
+
+def sanitize(name, val):
+    # 拒绝任何控制字符，Python 端二次防御
+    if re.search(r'[\x00-\x1f\x7f]', val):
+        print(f"ERR: {name} 含控制字符", file=sys.stderr)
+        sys.exit(1)
+    return val
+
+host = sanitize("SMTP_HOST", os.environ["SMTP_HOST"])
+port = sanitize("SMTP_PORT", os.environ["SMTP_PORT"])
+mail_from = sanitize("MAIL_FROM", os.environ["MAIL_FROM"])
+mail_pass = sanitize("MAIL_PASS", os.environ["MAIL_PASS"])
+
+# msmtprc 不支持值带引号；如果密码或字段含空格/# 等，msmtp 解析时会出现非预期行为。
+# 实测 msmtp 对 password 字段是按"行尾前所有内容"读取，空格会被保留为密码一部分；
+# 但 # 在某些版本会被当成行内注释。这里采取保守策略：明确警告这些字符。
+warn_chars = []
+if " " in mail_pass: warn_chars.append("空格")
+if "#" in mail_pass: warn_chars.append("#")
+if "\\" in mail_pass: warn_chars.append("\\")
+if warn_chars:
+    print(f"WARN: 密码含 {','.join(warn_chars)}，部分 msmtp 版本可能解析异常", file=sys.stderr)
+
+tls_starttls = "off" if port == "465" else "on"
+
+content = f"""defaults
 auth           on
-tls            ${TLS_TYPE}
-tls_starttls   ${TLS_STARTTLS}
+tls            on
+tls_starttls   {tls_starttls}
 tls_trust_file /etc/ssl/certs/ca-certificates.crt
 
 account        alert
-host           ${SMTP_HOST}
-port           ${SMTP_PORT}
-from           ${MAIL_FROM}
-user           ${MAIL_FROM}
-password       ${MAIL_PASS}
+host           {host}
+port           {port}
+from           {mail_from}
+user           {mail_from}
+password       {mail_pass}
 
 account default : alert
-EOF
-    chmod 600 /root/.msmtprc
+"""
+
+fd = os.open("/root/.msmtprc", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(content)
+PYEOF
 
     cat > "$MONITOR_CONF" << EOF
 MAIL_TO=${MAIL_TO}
@@ -1738,28 +1966,24 @@ MAIL_FROM=${MAIL_FROM}
 CHECK_INTERVAL=60
 AUTO_RESTART=yes
 EOF
+    chmod 600 "$MONITOR_CONF"
 
-    echo -e "${YELLOW}正在发送测试邮件...${NC}"
-    TEST_BODY="Xray 监控报警测试邮件
+    echo -e "${YELLOW}发送测试邮件...${NC}"
+    TEST_BODY="Xray 监控报警测试
 服务器: $(curl -s4 --max-time 5 ip.sb 2>/dev/null || echo unknown)
 时间: $(date)"
-
-    # set -e 下，管道末尾命令失败会直接杀脚本。
-    # 用 if 条件包裹才能正确走到 else 分支打印错误提示。
     if build_mail "Xray Monitor Test" "$TEST_BODY" "$MAIL_FROM" "$MAIL_TO" | msmtp "$MAIL_TO" 2>/dev/null; then
-        echo -e "${GREEN}✓ 测试邮件发送成功，请检查收件箱${NC}"
+        echo -e "${GREEN}✓ 测试邮件已发送${NC}"
     else
         echo -e "${RED}✗ 发送失败，请检查 SMTP 配置${NC}"
-        echo -e "${YELLOW}常见问题：Gmail 需要开启应用专用密码，QQ邮箱需要授权码${NC}"
+        echo -e "${YELLOW}Gmail 需应用专用密码；QQ 需授权码${NC}"
     fi
 }
 
 install_monitor() {
     if [ ! -f "$MONITOR_CONF" ]; then
-        echo -e "${RED}请先配置邮件通知（选 a）${NC}"
-        return
+        echo -e "${RED}请先配置邮件通知（选 a）${NC}"; return
     fi
-
     source "$MONITOR_CONF"
     VPS_IP=$(get_ip)
 
@@ -1769,61 +1993,46 @@ CONFIG_FILE="/usr/local/etc/xray/config.json"
 MONITOR_CONF="/root/.xray_monitor.conf"
 MONITOR_LOG="/var/log/xray/monitor.log"
 ALERT_LOCK="/tmp/.xray_alert_lock"
-
 source "$MONITOR_CONF"
 VPS_IP=$(curl -s4 ip.sb 2>/dev/null || echo "unknown")
 HOSTNAME=$(hostname)
 NOW=$(date "+%Y-%m-%d %H:%M:%S")
 
-log() {
-    echo "[$NOW] $1" >> "$MONITOR_LOG"
-}
+log() { echo "[$NOW] $1" >> "$MONITOR_LOG"; }
 
 send_alert() {
-    local SUBJECT="$1"
-    local BODY="$2"
+    local SUBJECT="$1" BODY="$2"
     local LOCK_KEY=$(echo "$SUBJECT" | md5sum | cut -d' ' -f1)
     local LOCK_FILE="${ALERT_LOCK}_${LOCK_KEY}"
-
     if [ -f "$LOCK_FILE" ]; then
-        local LOCK_AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
-        if [ "$LOCK_AGE" -lt 1800 ]; then
-            return
-        fi
+        local AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
+        [ "$AGE" -lt 1800 ] && return
     fi
-
-    local FULL_BODY="${BODY}
+    local FULL="${BODY}
 
 服务器: ${VPS_IP} (${HOSTNAME})
 时间: ${NOW}"
-
     printf "Subject: [Xray Alert] %s\r\nFrom: %s\r\nTo: %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s" \
-        "$SUBJECT" "$MAIL_FROM" "$MAIL_TO" "$FULL_BODY" | msmtp "$MAIL_TO" 2>/dev/null
-
+        "$SUBJECT" "$MAIL_FROM" "$MAIL_TO" "$FULL" | msmtp "$MAIL_TO" 2>/dev/null
     touch "$LOCK_FILE"
     log "ALERT SENT: $SUBJECT"
 }
 
-ERRORS=0
-DETAILS=""
+ERRORS=0; DETAILS=""
 
 if ! systemctl is-active --quiet xray; then
-    ERRORS=$((ERRORS + 1))
+    ERRORS=$((ERRORS+1))
     DETAILS="${DETAILS}
 [故障] Xray 进程已停止"
-    log "ERROR: Xray is not running"
-
+    log "ERROR: Xray not running"
     if [ "$AUTO_RESTART" = "yes" ]; then
-        systemctl restart xray
-        sleep 3
+        systemctl restart xray; sleep 3
         if systemctl is-active --quiet xray; then
             DETAILS="${DETAILS}
-[恢复] 已自动重启成功"
-            log "AUTO RESTART: success"
+[恢复] 已自动重启"
         else
             DETAILS="${DETAILS}
-[失败] 自动重启失败，需要手动处理"
-            log "AUTO RESTART: failed"
+[失败] 自动重启失败"
         fi
     fi
 fi
@@ -1831,97 +2040,64 @@ fi
 if [ -f "$CONFIG_FILE" ]; then
     CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
 import json, socket, os
-
-with open(os.environ["CONFIG_FILE"], "r") as f:
+with open(os.environ["CONFIG_FILE"]) as f:
     config = json.load(f)
-
-failures = []
-for ob in config.get("outbounds", []):
+fails = []
+for ob in config.get("outbounds",[]):
     if ob.get("protocol") == "socks":
-        servers = ob.get("settings", {}).get("servers", [])
-        tag = ob.get("tag", "unknown")
-        for s in servers:
-            addr = s["address"]
-            port = s["port"]
+        for s in ob.get("settings",{}).get("servers",[]):
             try:
-                sock = socket.create_connection((addr, port), timeout=10)
+                sock = socket.create_connection((s["address"], s["port"]), timeout=10)
                 sock.close()
             except Exception as e:
-                failures.append(f"{addr}:{port} [{tag}] - {e}")
-
-# 写标记文件代替 sys.exit(1)，避免 systemd service 记录为 failed
-failure_file = "/tmp/.xray_node_failures"
-if failures:
-    with open(failure_file, "w") as f:
-        for fail in failures:
-            f.write(fail + "\n")
-else:
-    if os.path.exists(failure_file):
-        os.remove(failure_file)
+                fails.append(f"{s['address']}:{s['port']} [{ob.get('tag','?')}] - {e}")
+ff = "/tmp/.xray_node_failures"
+if fails:
+    with open(ff,"w") as f:
+        for x in fails: f.write(x+"\n")
+elif os.path.exists(ff):
+    os.remove(ff)
 PYEOF
-
     if [ -f /tmp/.xray_node_failures ]; then
-        ERRORS=$((ERRORS + 1))
-        NODE_FAILURES=$(cat /tmp/.xray_node_failures)
+        ERRORS=$((ERRORS+1))
+        NF=$(cat /tmp/.xray_node_failures)
         DETAILS="${DETAILS}
 [故障] 落地节点不通:
-${NODE_FAILURES}"
-        log "ERROR: Node unreachable: $NODE_FAILURES"
+${NF}"
     fi
 fi
 
-MEM_PERCENT=$(free | awk '/Mem:/ {if ($2>0) printf "%.0f", $3/$2*100; else print 0}')
-if [ "$MEM_PERCENT" -gt 90 ]; then
-    ERRORS=$((ERRORS + 1))
-    DETAILS="${DETAILS}
-[警告] 内存使用率 ${MEM_PERCENT}%"
-    log "WARNING: Memory usage ${MEM_PERCENT}%"
-fi
-
-DISK_PERCENT=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
-if [ "$DISK_PERCENT" -gt 90 ]; then
-    ERRORS=$((ERRORS + 1))
-    DETAILS="${DETAILS}
-[警告] 磁盘使用率 ${DISK_PERCENT}%"
-    log "WARNING: Disk usage ${DISK_PERCENT}%"
-fi
+MEM=$(free | awk '/Mem:/ {if ($2>0) printf "%.0f", $3/$2*100; else print 0}')
+[ "$MEM" -gt 90 ] && { ERRORS=$((ERRORS+1)); DETAILS="${DETAILS}
+[警告] 内存使用率 ${MEM}%"; }
+DISK=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
+[ "$DISK" -gt 90 ] && { ERRORS=$((ERRORS+1)); DETAILS="${DETAILS}
+[警告] 磁盘使用率 ${DISK}%"; }
 
 if [ -f "$CONFIG_FILE" ]; then
     PORTS=$(CONFIG_FILE="$CONFIG_FILE" python3 -c "
-import json, os
-with open(os.environ['CONFIG_FILE']) as f:
-    config=json.load(f)
-for inb in config.get('inbounds',[]):
-    print(inb.get('port',''))
-" 2>/dev/null)
-    for PORT in $PORTS; do
-        if ! ss -tlnp | grep -q ":${PORT} "; then
-            ERRORS=$((ERRORS + 1))
-            DETAILS="${DETAILS}
-[故障] 端口 ${PORT} 未监听"
-            log "ERROR: Port ${PORT} not listening"
+import json,os
+cfg=json.load(open(os.environ['CONFIG_FILE']))
+for inb in cfg.get('inbounds',[]):
+    print(inb.get('port',''))" 2>/dev/null)
+    for P in $PORTS; do
+        if ! ss -tlnp | grep -q ":${P} "; then
+            ERRORS=$((ERRORS+1)); DETAILS="${DETAILS}
+[故障] 端口 ${P} 未监听"
         fi
     done
 fi
 
-if [ $ERRORS -gt 0 ]; then
-    send_alert "发现 ${ERRORS} 个问题" "$DETAILS"
-fi
-
-if [ $ERRORS -eq 0 ]; then
-    log "OK: All checks passed"
-fi
+[ $ERRORS -gt 0 ] && send_alert "发现 ${ERRORS} 个问题" "$DETAILS"
+[ $ERRORS -eq 0 ] && log "OK"
 
 if [ -f "$MONITOR_LOG" ]; then
-    LOG_SIZE=$(stat -c %s "$MONITOR_LOG" 2>/dev/null || echo 0)
-    if [ "$LOG_SIZE" -gt 10485760 ]; then
-        tail -n 5000 "$MONITOR_LOG" > "${MONITOR_LOG}.tmp"
-        mv "${MONITOR_LOG}.tmp" "$MONITOR_LOG"
-    fi
+    LS=$(stat -c %s "$MONITOR_LOG" 2>/dev/null || echo 0)
+    [ "$LS" -gt 10485760 ] && { tail -n 5000 "$MONITOR_LOG" > "${MONITOR_LOG}.tmp"; mv "${MONITOR_LOG}.tmp" "$MONITOR_LOG"; }
 fi
 MONEOF
 
-    chmod +x "$MONITOR_SCRIPT"
+    chmod 700 "$MONITOR_SCRIPT"
 
     cat > /etc/systemd/system/xray-monitor.service << EOF
 [Unit]
@@ -1948,17 +2124,12 @@ EOF
     systemctl daemon-reload
     systemctl enable xray-monitor.timer
     systemctl start xray-monitor.timer
-
-    echo -e "${GREEN}✓ 监控已启动（每分钟检查一次）${NC}"
-    echo -e "${GREEN}  检查项: Xray进程 / 节点连通 / 内存 / 磁盘 / 端口${NC}"
-    echo -e "${GREEN}  自动重启: 已开启${NC}"
-    echo -e "${GREEN}  报警邮件: ${MAIL_TO}${NC}"
-    echo -e "${GREEN}  日志文件: ${MONITOR_LOG}${NC}"
+    echo -e "${GREEN}✓ 监控已启动（每分钟），日志: ${MONITOR_LOG}${NC}"
 }
 
 stop_monitor() {
-    systemctl stop xray-monitor.timer 2>/dev/null
-    systemctl disable xray-monitor.timer 2>/dev/null
+    systemctl stop xray-monitor.timer 2>/dev/null || true
+    systemctl disable xray-monitor.timer 2>/dev/null || true
     echo -e "${GREEN}✓ 监控已停止${NC}"
 }
 
@@ -1975,45 +2146,31 @@ monitor_menu() {
     echo -e "${CYAN}╔═══════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║              监控报警管理                     ║${NC}"
     echo -e "${CYAN}╚═══════════════════════════════════════════════╝${NC}"
-    echo ""
-
     if systemctl is-active --quiet xray-monitor.timer 2>/dev/null; then
         echo -e "  当前状态: ${GREEN}运行中${NC}"
     else
         echo -e "  当前状态: ${RED}未启动${NC}"
     fi
-    echo ""
-
     echo "  a) 配置邮件通知"
     echo "  b) 启动监控"
     echo "  c) 停止监控"
     echo "  d) 查看监控日志"
     echo "  e) 发送测试邮件"
     echo "  f) 返回主菜单"
-    echo ""
-    read -p "  选择: " MON_CHOICE
-
-    case $MON_CHOICE in
-        a)
-            setup_mail
-            ;;
-        b)
-            install_monitor
-            ;;
-        c)
-            stop_monitor
-            ;;
-        d)
-            show_monitor_log
-            ;;
+    read -rp "  选择: " MC
+    case $MC in
+        a) setup_mail;;
+        b) install_monitor;;
+        c) stop_monitor;;
+        d) show_monitor_log;;
         e)
             if [ -f "$MONITOR_CONF" ]; then
                 source "$MONITOR_CONF"
                 VPS_IP=$(get_ip)
-                TEST_BODY="测试邮件
+                TB="测试邮件
 服务器: ${VPS_IP}
 时间: $(date)"
-                if build_mail "Xray Monitor Test" "$TEST_BODY" "$MAIL_FROM" "$MAIL_TO" | msmtp "$MAIL_TO" 2>/dev/null; then
+                if build_mail "Xray Monitor Test" "$TB" "$MAIL_FROM" "$MAIL_TO" | msmtp "$MAIL_TO" 2>/dev/null; then
                     echo -e "${GREEN}✓ 测试邮件已发送${NC}"
                 else
                     echo -e "${RED}✗ 发送失败${NC}"
@@ -2022,9 +2179,7 @@ monitor_menu() {
                 echo -e "${RED}请先配置邮件（选 a）${NC}"
             fi
             ;;
-        f)
-            return
-            ;;
+        f) return;;
     esac
 }
 
@@ -2032,7 +2187,7 @@ monitor_menu() {
 main_menu() {
     print_banner
     echo "  1) 全新安装 (首次部署)"
-    echo "  2) 添加节点"
+    echo "  2) 添加节点 (住宅 SOCKS5)"
     echo "  3) 删除节点"
     echo "  4) 修改端口"
     echo "  5) 查看状态"
@@ -2042,10 +2197,10 @@ main_menu() {
     echo "  9) 重启 Xray"
     echo "  10) 监控报警"
     echo "  11) 卸载"
-    echo "  12) 添加 VPS 直连节点 (不经住宅 IP)"
+    echo "  12) 添加 VPS 直连节点"
     echo "  0) 退出"
     echo ""
-    read -p "请选择 [0-12]: " CHOICE
+    read -rp "请选择 [0-12]: " CHOICE
 
     case $CHOICE in
         1)
@@ -2059,64 +2214,45 @@ main_menu() {
             start_service
             print_result
             ;;
-        2)
-            add_node
-            ;;
-        3)
-            delete_node
-            ;;
-        4)
-            change_port
-            ;;
-        5)
-            show_status
-            ;;
-        6)
-            show_traffic
-            ;;
-        7)
-            troubleshoot
-            ;;
-        8)
-            update_xray
-            ;;
-        9)
-            systemctl restart xray
-            echo -e "${GREEN}已重启${NC}"
-            systemctl status xray --no-pager
-            ;;
-        10)
-            monitor_menu
-            ;;
-        11)
-            uninstall
-            ;;
-        12)
-            add_direct_node
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效选项${NC}"
-            ;;
+        2)  add_node;;
+        3)  delete_node;;
+        4)  change_port;;
+        5)  show_status;;
+        6)  show_traffic;;
+        7)  troubleshoot;;
+        8)  update_xray;;
+        9)  systemctl restart xray; echo -e "${GREEN}已重启${NC}"; systemctl status xray --no-pager;;
+        10) monitor_menu;;
+        11) uninstall;;
+        12) add_direct_node;;
+        0)  exit 0;;
+        *)  echo -e "${RED}无效选项${NC}";;
     esac
-
     echo ""
-    read -p "按回车键返回主菜单..." _
+    read -rp "按回车键返回主菜单..." _
 }
 
-# ========== 启动前依赖自检 ==========
+# ========== 启动前预检 ==========
 preflight_check() {
+    # root 检查
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}✗ 此脚本必须以 root 运行${NC}"
+        exit 1
+    fi
+
+    # systemd 检查
+    if ! command -v systemctl &>/dev/null; then
+        echo -e "${RED}✗ 未检测到 systemctl，本脚本仅支持 systemd 系统${NC}"
+        exit 1
+    fi
+
+    # 依赖工具检查
     local missing=()
     for cmd in python3 curl ss; do
-        if ! command -v "$cmd" &>/dev/null; then
-            missing+=("$cmd")
-        fi
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${YELLOW}⚠ 缺少必要工具: ${missing[*]}${NC}"
-        echo -e "${YELLOW}  正在尝试自动安装...${NC}"
+        echo -e "${YELLOW}⚠ 缺少: ${missing[*]} ，尝试自动安装...${NC}"
         if command -v apt &>/dev/null; then
             export DEBIAN_FRONTEND=noninteractive
             apt update -y >/dev/null 2>&1 || true
@@ -2126,19 +2262,34 @@ preflight_check() {
         elif command -v yum &>/dev/null; then
             yum install -y python3 curl iproute >/dev/null 2>&1 || true
         fi
-        # 再次检查
         for cmd in python3 curl ss; do
             if ! command -v "$cmd" &>/dev/null; then
-                echo -e "${RED}✗ 无法自动安装 $cmd，请手动安装后重试${NC}"
-                exit 1
+                echo -e "${RED}✗ 无法安装 $cmd${NC}"; exit 1
             fi
         done
         echo -e "${GREEN}✓ 依赖已就绪${NC}"
     fi
+
+    # 443 端口占用检查（提示性，不阻塞）
+    if ss -tlnp 2>/dev/null | grep -q ":443 "; then
+        local who
+        who=$(ss -tlnp 2>/dev/null | grep ":443 " | grep -oP 'users:\(\(\K[^)]+' | head -1)
+        if [ -n "$who" ] && ! echo "$who" | grep -qi "xray"; then
+            echo -e "${YELLOW}⚠ 检测到 443 端口被非 xray 进程占用: ${who}${NC}"
+            echo -e "${YELLOW}  如继续部署，第一个节点将无法监听 443${NC}"
+            read -rp "  按回车继续，或 Ctrl+C 退出..." _
+        fi
+    fi
+
+    # 信息性：架构 / 发行版
+    if [ -f /etc/os-release ]; then
+        local osname
+        osname=$(. /etc/os-release && echo "${PRETTY_NAME:-unknown}")
+        echo -e "${CYAN}ℹ 系统: ${osname} ($(uname -m))${NC}"
+    fi
 }
 
 preflight_check
-
 while true; do
     main_menu
 done
