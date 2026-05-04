@@ -401,7 +401,7 @@ create_config_workfile() {
 # 重启 xray 并在失败时回滚到最近备份
 restart_with_rollback() {
     systemctl restart xray
-    sleep 2
+    sleep 3
     if systemctl is-active --quiet xray; then
         return 0
     fi
@@ -417,7 +417,7 @@ restart_with_rollback() {
 
     cp -a "$last_backup" "$CONFIG_FILE"
     systemctl restart xray
-    sleep 2
+    sleep 3
     if systemctl is-active --quiet xray; then
         echo -e "${GREEN}✓ 已回滚到 $last_backup，Xray 恢复运行${NC}"
         return 1   # 业务上仍然算"操作失败"
@@ -601,10 +601,18 @@ apply_firewall_port() {
                 return 3
             fi
         fi
-        if command -v netfilter-persistent &>/dev/null; then
-            netfilter-persistent save >/dev/null 2>&1 || true
-        elif [ -d /etc/iptables ]; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        local ipt_persisted=0
+        if command -v netfilter-persistent &>/dev/null && netfilter-persistent save >/dev/null 2>&1; then
+            ipt_persisted=1
+        elif [ -d /etc/iptables ] && iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
+            ipt_persisted=1
+        elif command -v service &>/dev/null && service iptables save >/dev/null 2>&1; then
+            ipt_persisted=1
+        fi
+        if [ "$ipt_persisted" -eq 1 ]; then
+            echo -e "  ${GREEN}✓ iptables 规则已尝试持久化${NC}"
+        else
+            echo -e "  ${YELLOW}⚠ iptables 当前已放行，但未检测到可用持久化工具，重启后可能失效${NC}"
         fi
         echo -e "  ${CYAN}ℹ 提醒：云厂商安全组仍需手动放行 ${port}/tcp${NC}"
         return 0
@@ -1050,6 +1058,9 @@ print_result() {
     echo -e "  Short ID:   ${SHORT_ID}"
     echo ""
     echo -e "${GREEN}所有链接已保存到 ${INFO_FILE} (权限 600)${NC}"
+    if [ "$CLIENT_FP" = "chrome" ]; then
+        echo -e "${CYAN}ℹ iOS / Shadowrocket 用户如需更贴近 iOS 指纹，可用 CLIENT_FP=ios 重新运行脚本${NC}"
+    fi
     if [ "$XRAY_REDACT" = "1" ]; then
         echo -e "${YELLOW}（敏感字段已隐藏，需查看完整信息请用 XRAY_REDACT=0 重跑或直接查看 INFO_FILE）${NC}"
     fi
