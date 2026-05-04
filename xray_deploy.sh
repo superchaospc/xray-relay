@@ -269,7 +269,10 @@ def ok(host, port, user, pwd):
         fail("用户名为空")
     if pwd is None or pwd == "":
         fail("密码为空")
-    # 用 \x1f 分隔，避免 host/user/pwd 含 \t 或换行
+    for field in (host, str(p), user, pwd):
+        if re.search(r'[\x00-\x1f\x7f]', field):
+            fail("字段含控制字符（换行/Tab/回车等）")
+    # 用 \x1f 分隔，控制字符已拒绝，避免 payload 被换行截断
     print("OK\t" + "\x1f".join([host, str(p), user, pwd]))
     sys.exit(0)
 
@@ -282,7 +285,7 @@ if raw.startswith(("socks5://", "socks://")):
         port = u.port
         username = u.username
         password = u.password
-    except (ValueError, Exception) as e:
+    except Exception as e:
         fail(f"URL 解析失败: {e}")
     if not host or not port:
         fail("URL 缺少 host 或 port")
@@ -436,7 +439,8 @@ candidate = 8443
 while candidate in used:
     candidate += 1
     if candidate > 20000:
-        print("ERROR: next inbound port exceeds 20000"); sys.exit(0)
+        print("ERROR: next inbound port exceeds 20000")
+        sys.exit(2)
 print(candidate)
 PYEOF
 }
@@ -769,11 +773,14 @@ def ok(h,p,u,w):
     if not h: fail("host 为空")
     if not u: fail("用户名为空")
     if not w: fail("密码为空")
+    for f in (h,str(p),u,w):
+        if re.search(r"[\x00-\x1f\x7f]", f):
+            fail("字段含控制字符（换行/Tab/回车等）")
     print("OK\t"+"\x1f".join([h,str(p),u,w])); sys.exit(0)
 if raw.startswith(("socks5://","socks://")):
     try:
         u=urlsplit(raw); h=u.hostname; po=u.port; un=u.username; pw=u.password
-    except (ValueError, Exception) as e:
+    except Exception as e:
         fail(f"URL 解析失败: {e}")
     if not h or not po: fail("URL 缺少 host/port")
     ok(h,po,unquote(un or ""),unquote(pw or ""))
@@ -860,6 +867,7 @@ for idx, node in enumerate(raw_nodes, start=1):
     tag_in = f"vless-in-{idx}"
     inbounds.append({
         "tag": tag_in, "port": int(port), "protocol": "vless",
+        "_remark": name,
         "settings": {"clients":[{"id":uuid,"flow":"xtls-rprx-vision"}],"decryption":"none"},
         "streamSettings": {"network":"tcp","security":"reality",
             "realitySettings":{"dest":reality_dest,"serverNames":[reality_server_name],
@@ -1140,6 +1148,8 @@ for inb in config.get("inbounds", []):
     ob = outbounds.get(out_tag, {})
     name = old_names.get(port)
     if not name:
+        name = inb.get("_remark")
+    if not name:
         name = "VPS-Direct" if out_tag == "direct" else f"Port-{port}"
     safe_name = re.sub(r"[\s#?&\r\n\t]+", "-", name).strip("-") or f"Port-{port}"
 
@@ -1185,7 +1195,10 @@ add_node() {
     fi
     PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
 
-    NEW_PORT=$(get_next_inbound_port)
+    if ! NEW_PORT=$(get_next_inbound_port); then
+        echo -e "${RED}${NEW_PORT:-ERROR: 无法计算下一个监听端口}${NC}"
+        return
+    fi
     if [[ "$NEW_PORT" == ERROR:* ]]; then
         echo -e "${RED}${NEW_PORT}${NC}"; return
     fi
@@ -1219,6 +1232,7 @@ add_node() {
         TAG_NUM="$TAG_NUM" NEW_PORT="$NEW_PORT" UUID="$UUID" \
         PRIVATE_KEY="$PRIVATE_KEY" SHORT_ID="$SHORT_ID" \
         REALITY_DEST="$REALITY_DEST" REALITY_SERVER_NAME="$REALITY_SERVER_NAME" \
+        NODE_NAME="$NODE_NAME" \
         S_HOST="$S_HOST" S_PORT="$S_PORT" S_USER="$S_USER" S_PASS="$S_PASS" \
         python3 << 'PYEOF'
 import json, os, sys
@@ -1230,6 +1244,7 @@ private_key = os.environ["PRIVATE_KEY"]
 short_id = os.environ["SHORT_ID"]
 reality_dest = os.environ["REALITY_DEST"]
 reality_server_name = os.environ["REALITY_SERVER_NAME"]
+node_name = os.environ["NODE_NAME"]
 s_host = os.environ["S_HOST"]
 try:
     s_port = int(os.environ["S_PORT"])
@@ -1243,6 +1258,7 @@ with open(new_config) as f:
 
 config.setdefault("inbounds", []).append({
     "tag": f"vless-in-{tag_num}", "port": new_port, "protocol": "vless",
+    "_remark": node_name,
     "settings": {"clients":[{"id":uuid,"flow":"xtls-rprx-vision"}],"decryption":"none"},
     "streamSettings": {"network":"tcp","security":"reality",
         "realitySettings":{"dest":reality_dest,"serverNames":[reality_server_name],
@@ -1316,7 +1332,10 @@ add_direct_node() {
     fi
     PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
 
-    NEW_PORT=$(get_next_inbound_port)
+    if ! NEW_PORT=$(get_next_inbound_port); then
+        echo -e "${RED}${NEW_PORT:-ERROR: 无法计算下一个监听端口}${NC}"
+        return
+    fi
     if [[ "$NEW_PORT" == ERROR:* ]]; then
         echo -e "${RED}${NEW_PORT}${NC}"; return
     fi
@@ -1343,6 +1362,7 @@ add_direct_node() {
         TAG_NUM="$TAG_NUM" NEW_PORT="$NEW_PORT" UUID="$UUID" \
         PRIVATE_KEY="$PRIVATE_KEY" SHORT_ID="$SHORT_ID" \
         REALITY_DEST="$REALITY_DEST" REALITY_SERVER_NAME="$REALITY_SERVER_NAME" \
+        NODE_NAME="$NODE_NAME" \
         python3 << 'PYEOF'
 import json, os
 new_config = os.environ["NEW_CONFIG_FILE"]
@@ -1350,12 +1370,14 @@ tag_num = os.environ["TAG_NUM"]
 new_port = int(os.environ["NEW_PORT"])
 uuid = os.environ["UUID"]; private_key = os.environ["PRIVATE_KEY"]; short_id = os.environ["SHORT_ID"]
 reality_dest = os.environ["REALITY_DEST"]; reality_server_name = os.environ["REALITY_SERVER_NAME"]
+node_name = os.environ["NODE_NAME"]
 
 with open(new_config) as f:
     config = json.load(f)
 
 config.setdefault("inbounds", []).append({
     "tag": f"vless-in-{tag_num}", "port": new_port, "protocol": "vless",
+    "_remark": node_name,
     "settings": {"clients":[{"id":uuid,"flow":"xtls-rprx-vision"}],"decryption":"none"},
     "streamSettings": {"network":"tcp","security":"reality",
         "realitySettings":{"dest":reality_dest,"serverNames":[reality_server_name],
@@ -2186,7 +2208,6 @@ PYEOF
     cat > "$MONITOR_CONF" << EOF
 MAIL_TO=${MAIL_TO}
 MAIL_FROM=${MAIL_FROM}
-CHECK_INTERVAL=60
 AUTO_RESTART=yes
 EOF
     chmod 600 "$MONITOR_CONF"
@@ -2208,7 +2229,6 @@ install_monitor() {
         echo -e "${RED}请先配置邮件通知（选 a）${NC}"; return
     fi
     source "$MONITOR_CONF"
-    VPS_IP=$(get_ip)
 
     cat > "$MONITOR_SCRIPT" << 'MONEOF'
 #!/bin/bash
@@ -2217,7 +2237,6 @@ MONITOR_CONF="/root/.xray_monitor.conf"
 MONITOR_LOG="/var/log/xray/monitor.log"
 ALERT_LOCK="/tmp/.xray_alert_lock"
 source "$MONITOR_CONF"
-VPS_IP=$(curl -s4 ip.sb 2>/dev/null || echo "unknown")
 HOSTNAME=$(hostname)
 NOW=$(date "+%Y-%m-%d %H:%M:%S")
 
@@ -2225,20 +2244,26 @@ log() { echo "[$NOW] $1" >> "$MONITOR_LOG"; }
 
 send_alert() {
     local SUBJECT="$1" BODY="$2"
-    local LOCK_KEY=$(echo "$SUBJECT" | md5sum | cut -d' ' -f1)
+    local LOCK_KEY
+    LOCK_KEY=$(printf "%s" "$BODY" | md5sum | cut -d' ' -f1)
     local LOCK_FILE="${ALERT_LOCK}_${LOCK_KEY}"
     if [ -f "$LOCK_FILE" ]; then
         local AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
         [ "$AGE" -lt 1800 ] && return
     fi
+    local VPS_IP
+    VPS_IP=$(curl -s4 --max-time 5 ip.sb 2>/dev/null || echo "unknown")
     local FULL="${BODY}
 
 服务器: ${VPS_IP} (${HOSTNAME})
 时间: ${NOW}"
-    printf "Subject: [Xray Alert] %s\r\nFrom: %s\r\nTo: %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s" \
-        "$SUBJECT" "$MAIL_FROM" "$MAIL_TO" "$FULL" | msmtp "$MAIL_TO" 2>/dev/null
-    touch "$LOCK_FILE"
-    log "ALERT SENT: $SUBJECT"
+    if printf "Subject: [Xray Alert] %s\r\nFrom: %s\r\nTo: %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s" \
+        "$SUBJECT" "$MAIL_FROM" "$MAIL_TO" "$FULL" | msmtp "$MAIL_TO" 2>/dev/null; then
+        touch "$LOCK_FILE"
+        log "ALERT SENT: $SUBJECT"
+    else
+        log "ALERT FAILED: $SUBJECT"
+    fi
 }
 
 ERRORS=0; DETAILS=""

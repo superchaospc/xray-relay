@@ -15,11 +15,14 @@ def ok(h,p,u,w):
     if not h: fail("host 为空")
     if not u: fail("用户名为空")
     if not w: fail("密码为空")
+    for f in (h,str(p),u,w):
+        if re.search(r"[\x00-\x1f\x7f]", f):
+            fail("字段含控制字符（换行/Tab/回车等）")
     print("OK\t"+"\x1f".join([h,str(p),u,w])); sys.exit(0)
 if raw.startswith(("socks5://","socks://")):
     try:
         u=urlsplit(raw); h=u.hostname; po=u.port; un=u.username; pw=u.password
-    except (ValueError, Exception) as e:
+    except Exception as e:
         fail(f"URL 解析失败: {e}")
     if not h or not po: fail("URL 缺少 host/port")
     ok(h,po,unquote(un or ""),unquote(pw or ""))
@@ -67,6 +70,9 @@ cases = [
     ("socks5://u:p@host:99999", "ERR"),
     # 端口 0 在 URL 里
     ("socks5://u:p@host:0", "ERR"),
+    # percent-encoded 控制字符会在 unquote 后变成真实换行/Tab，必须拒绝，不能让 bash read 截断
+    ("socks5://u:pass%0Apass2@host:1080", "ERR"),
+    ("socks5://u:pass%09pass2@host:1080", "ERR"),
 ]
 
 ok = 0; bad = 0
