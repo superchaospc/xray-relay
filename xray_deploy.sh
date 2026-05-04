@@ -717,6 +717,17 @@ generate_keys() {
     echo -e "  Short ID:    ${YELLOW}${SHORT_ID}${NC}"
 }
 
+derive_public_key() {
+    local private_key="$1"
+    local public_key
+    public_key=$(xray x25519 -i "$private_key" 2>/dev/null | grep -i "public" | awk '{print $NF}' || true)
+    if [ -z "$public_key" ]; then
+        echo -e "${RED}✗ 无法派生 public key，请检查 xray 二进制或 private key${NC}" >&2
+        return 1
+    fi
+    echo "$public_key"
+}
+
 collect_nodes() {
     echo ""
     echo -e "${GREEN}[步骤3] 添加 SOCKS5 住宅节点${NC}"
@@ -1073,9 +1084,8 @@ PYEOF
         echo -e "${YELLOW}⚠ 无法从现有配置读取节点身份，跳过刷新 ${INFO_FILE}${NC}"
         return 1
     fi
-    PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
-    if [ -z "$PUBLIC_KEY" ]; then
-        echo -e "${YELLOW}⚠ 无法派生 public key，跳过刷新 ${INFO_FILE}${NC}"
+    if ! PUBLIC_KEY=$(derive_public_key "$PRIVATE_KEY"); then
+        echo -e "${YELLOW}⚠ 跳过刷新 ${INFO_FILE}${NC}"
         return 1
     fi
 
@@ -1193,7 +1203,7 @@ add_node() {
         echo -e "${RED}现有配置中的业务节点密钥信息不完整${NC}"
         return
     fi
-    PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
+    PUBLIC_KEY=$(derive_public_key "$PRIVATE_KEY") || return
 
     if ! NEW_PORT=$(get_next_inbound_port); then
         echo -e "${RED}${NEW_PORT:-ERROR: 无法计算下一个监听端口}${NC}"
@@ -1327,7 +1337,7 @@ add_direct_node() {
     if [ -z "$PRIVATE_KEY" ] || [ -z "$SHORT_ID" ] || [ -z "$UUID" ]; then
         echo -e "${RED}现有配置密钥信息不完整${NC}"; return
     fi
-    PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
+    PUBLIC_KEY=$(derive_public_key "$PRIVATE_KEY") || return
 
     if ! NEW_PORT=$(get_next_inbound_port); then
         echo -e "${RED}${NEW_PORT:-ERROR: 无法计算下一个监听端口}${NC}"
@@ -1793,11 +1803,28 @@ PYEOF
         echo -e "  $(format_fw_status)"
         VPS_IP=$(get_ip)
         load_node_identity
-        PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
-        NEW_LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Port-${NEW_PORT}"
+        PUBLIC_KEY=$(derive_public_key "$PRIVATE_KEY") || return
+        NODE_NAME=$(CONFIG_FILE="$CONFIG_FILE" NEW_PORT="$NEW_PORT" python3 - << 'PYEOF'
+import json
+import os
+
+port = int(os.environ["NEW_PORT"])
+with open(os.environ["CONFIG_FILE"]) as f:
+    config = json.load(f)
+for inb in config.get("inbounds", []):
+    if inb.get("port") == port:
+        print(inb.get("_remark") or f"Port-{port}")
+        break
+else:
+    print(f"Port-{port}")
+PYEOF
+)
+        NODE_NAME=$(echo "$NODE_NAME" | tr ' \t#?&\r\n' '-' | tr -s '-' | sed 's/^-//; s/-$//')
+        [ -z "$NODE_NAME" ] && NODE_NAME="Port-${NEW_PORT}"
+        NEW_LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
         echo -e "${YELLOW}新链接:${NC} ${NEW_LINK}"
         refresh_info_file_from_config || true
-        show_qrcode "$NEW_LINK" "Port-${NEW_PORT}"
+        show_qrcode "$NEW_LINK" "$NODE_NAME"
     fi
 }
 
@@ -1943,6 +1970,7 @@ for inb in cfg.get('inbounds',[]):
 import json
 cfg = json.load(open('$CONFIG_FILE'))
 for inb in cfg.get('inbounds',[]):
+    if inb.get('tag') == 'api-in': continue
     print(inb.get('port',''))" 2>/dev/null || true)
         if [ -z "$PORTS" ]; then
             echo -e "  ${YELLOW}⚠ 无法解析端口列表，跳过端口监听检查${NC}"
@@ -2321,6 +2349,7 @@ if [ -f "$CONFIG_FILE" ]; then
 import json,os
 cfg=json.load(open(os.environ['CONFIG_FILE']))
 for inb in cfg.get('inbounds',[]):
+    if inb.get('tag') == 'api-in': continue
     print(inb.get('port',''))" 2>/dev/null)
     for P in $PORTS; do
         if ! ss -tlnp | grep -q ":${P} "; then

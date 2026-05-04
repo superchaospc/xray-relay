@@ -198,6 +198,7 @@ bash run_all_tests.sh
 - `shellcheck -S error xray_deploy.sh`（未安装则跳过）
 - SOCKS5 输入解析，包括 URL 端口非法、IPv6、密码特殊字符
 - 入站端口计算，包括端口耗尽时返回非 0
+- public key 派生失败、业务端口过滤与端口修改链接备注
 - 配置原子写入与回滚流程
 - 节点信息解析
 - SMTP 输入校验
@@ -209,7 +210,7 @@ bash run_all_tests.sh
 在 Debian 13 VPS 上的实测结果：
 
 ```text
-通过: 10  失败: 0  跳过: 1
+通过: 11  失败: 0  跳过: 1
 ```
 
 跳过项为未安装 `shellcheck`。
