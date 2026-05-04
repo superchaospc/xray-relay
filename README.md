@@ -20,12 +20,12 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🎯 **固定端口映射**：每个前置节点绑定独立监听端口，客户端可精确选择出口，不做负载均衡
 - 🧩 **多节点管理**：菜单化添加、删除节点，修改端口
 - 🛟 **安全写配置**：生成临时 JSON → `xray run -test` 校验 → 备份旧配置 → 原子替换 → 启动失败自动回滚
-- 🧱 **自动防火墙放行**：依次尝试 `ufw` / `firewalld` / `nftables` / `iptables`，nftables 会自动写入 `/etc/nftables.conf` 持久化，并对云厂商安全组给出提醒
+- 🧱 **自动防火墙放行**：依次尝试 `ufw` / `firewalld` / `nftables` / `iptables`，并尽量持久化规则，对云厂商安全组给出提醒
 - 🔒 **供应链保护**：默认拒绝未确认的 Xray 官方安装脚本来源，支持固定 commit 与 sha256 校验
 - ⚡ **BBR 加速**：自动开启 BBR 拥塞控制并写入内核调优参数
 - 📊 **流量统计**：基于 Xray API 的累计上行/下行流量查看
-- 🩺 **排错诊断**：一键检查服务状态、端口监听、防火墙规则、前置连通性
-- 🚨 **监控报警**：可选配置邮件告警（Gmail/QQ/163 等 SMTP），服务异常自动发信
+- 🩺 **排错诊断**：一键检查服务、配置、端口、防火墙、前置连通性、BBR、系统资源和错误日志
+- 🚨 **监控报警**：可选配置邮件告警（Gmail/QQ/163 等 SMTP），每分钟巡检，异常自动发信
 - 📱 **终端二维码**：节点生成后直接在终端渲染 VLESS 二维码，主流客户端扫码即导入
 - 🐧 **多发行版支持**：Debian / Ubuntu / CentOS / AlmaLinux / Rocky / Fedora
 
@@ -36,8 +36,9 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 配置写入采用「临时文件 → `xray run -test` → 备份 → 原子替换 → 重启失败回滚」流程
 - Xray 官方安装脚本默认不再跟随 `main`，必须显式 pin commit 或临时指定 `XRAY_INSTALL_REF=main`
 - SOCKS5 支持常见 `host:port:user:pass` 与 URL 格式，并拒绝控制字符注入
-- 防火墙规则支持 `ufw` / `firewalld` / `nftables` / `iptables`，nftables 会自动持久化
+- 防火墙规则支持 `ufw` / `firewalld` / `nftables` / `iptables`，nftables 与 iptables 会尝试自动持久化
 - 节点备注写入配置元数据 `_remark`，修改端口或重建 `INFO_FILE` 后仍能保留原名称
+- systemd drop-in 自动提升 Xray 文件描述符上限到 `65535`
 - 默认只安装必要依赖，不做整机 `apt upgrade`；需要时可用 `XRAY_FULL_UPGRADE=1`
 - 敏感文件统一 `600` 权限，终端输出可用 `XRAY_REDACT=1` 隐藏 UUID / 密钥中段
 
@@ -50,7 +51,7 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - ⚙️ 内核 ≥ 4.9（支持 BBR，绝大多数现代发行版默认满足）
 - 🌐 出站 443 可访问 GitHub（用于首次下载官方 Xray 安装脚本）
 
-脚本会自动检测并安装依赖：`xray-core`、`python3`、`curl`、`iproute2`、`qrencode`、`msmtp`（仅配置邮件时）。
+脚本会自动检测并安装依赖：`xray-core`、`python3`、`curl`、`iproute2`、`ca-certificates`、`qrencode`、`msmtp`（仅配置邮件时）。
 
 > 注意：脚本默认只安装必要依赖，不会整机 `apt upgrade`。如果确实想顺带升级系统，可用 `XRAY_FULL_UPGRADE=1` 运行。
 
@@ -125,8 +126,9 @@ curl -fsSL https://raw.githubusercontent.com/superchaospc/xray-relay/main/xray_d
 1. 运行脚本，选择 **`1) 全新安装`**
 2. 在 SOCKS5 节点录入阶段输入 `done`
 3. 按提示输入 `y` 创建 443 端口的 VPS 直连节点
-4. 脚本自动完成：依赖检查 → Xray 检查/安装 → 密钥生成 → 配置校验下发 → BBR → 防火墙 → 服务启动
-5. 部署完成后会输出 VLESS 链接和二维码
+4. 输入节点备注名称（回车默认 `VPS-Direct`）
+5. 脚本自动完成：依赖检查 → Xray 检查/安装 → 密钥生成 → 配置校验下发 → BBR → 防火墙 → 服务启动
+6. 部署完成后会输出 VLESS 链接和二维码
 
 ### 🛠️ 首次部署住宅 SOCKS5 中转
 
@@ -136,10 +138,10 @@ curl -fsSL https://raw.githubusercontent.com/superchaospc/xray-relay/main/xray_d
    - 例如：`161.77.77.5:12324:user01:pass01`
    - 这种格式中密码不能包含 `:`
 3. 如果用户名或密码有特殊字符，请使用 URL 格式：
-   - `socks5://user:pass@host:port`
+   - `socks5://user:pass@host:port` 或 `socks://user:pass@host:port`
    - 特殊字符请按 URL 编码，例如 `:` 写成 `%3A`，`@` 写成 `%40`
    - 按 `done` 或直接回车结束录入
-4. 脚本会为每个节点分配独立入口端口，客户端连接不同端口即可选择不同出口
+4. 脚本会为每个节点分配独立入口端口，客户端连接不同端口即可选择不同出口。首次安装时第 1 个节点默认监听 `443`，第 2 个开始为 `8444`、`8445`...；后续菜单添加节点会从 `8443` 起寻找空闲端口。
 
 ### 📲 导入客户端
 
@@ -170,6 +172,7 @@ curl -fsSL https://raw.githubusercontent.com/superchaospc/xray-relay/main/xray_d
 | 10 | 监控报警（邮件通知配置） |
 | 11 | 卸载 |
 | 12 | 添加 VPS 直连节点（不经住宅 IP） |
+| 0 | 退出 |
 
 ---
 
@@ -206,8 +209,11 @@ flowchart LR
 | --- | --- |
 | `/usr/local/etc/xray/config.json` | Xray 主配置 |
 | `/root/xray_nodes_info.txt` | 所有节点的 VLESS 链接备份 |
+| `/root/.xray_vps_ip` | VPS 公网 IP 缓存 |
 | `/etc/sysctl.d/99-xray.conf` | BBR 与内核调优参数 |
+| `/etc/systemd/system/xray.service.d/limits.conf` | Xray 文件描述符上限配置 |
 | `/root/.xray_monitor.conf` | 监控告警配置（如启用） |
+| `/root/.xray_monitor.sh` | 监控巡检脚本 |
 | `/var/log/xray/` | Xray 运行日志 |
 
 脚本会尽量让 `/usr/local/etc/xray/config.json` 继承现有 owner/group。某些 Xray service 会以 `nobody` 用户运行，如果配置文件被写成 `root:root 600`，服务会因为 `permission denied` 无法启动；当前脚本已针对这种情况处理。
@@ -223,10 +229,10 @@ flowchart LR
 - 安装必要依赖与 Xray core；默认不执行整机升级
 - 写入 `/usr/local/etc/xray/config.json`，并保留最近 5 份 `config.json.bak.*` 备份
 - 写入 `/etc/sysctl.d/99-xray.conf` 开启 BBR 与网络参数优化
-- 可能创建 1G swap（仅内存较小且无 swap 时）
+- 如果系统没有 swap 且不存在 `/swapfile`，会创建 1G swap
 - 修改系统防火墙规则，并尽量持久化到对应后端
 - 配置监控报警时会写入 `/root/.msmtprc` 与 `/root/.xray_monitor.conf`，权限为 `600`
-- 启用监控时会写入 `xray-monitor.service` / `xray-monitor.timer`
+- 启用监控时会写入 `xray-monitor.service` / `xray-monitor.timer`，timer 每分钟运行一次
 
 ---
 
@@ -275,7 +281,16 @@ XRAY_INSTALL_REF=main /root/xray_deploy.sh
 
 **Q: 部署后客户端连不上？**
 
-A: 运行菜单 `7) 排错诊断`，会依次检查 Xray 服务状态、端口监听、防火墙、前置 SOCKS5 连通性。
+A: 运行菜单 `7) 排错诊断`，会依次检查：
+
+- Xray 服务状态与版本
+- 配置文件是否存在、JSON 是否合法、业务节点是否有 privateKey
+- 业务端口监听
+- 防火墙放行状态
+- SOCKS5 落地节点连通性
+- BBR 状态
+- 内存、磁盘、CPU 负载
+- 最近 1 小时 Xray 错误日志
 
 还需要确认云厂商安全组已放行对应 TCP 端口，例如 443、8443 等。脚本只能修改 VPS 系统内的防火墙，不能自动修改云厂商控制台里的安全组。
 
@@ -308,7 +323,7 @@ A: 大多数代理商给的是 `host:port:user:pass`，例如：
 161.77.48.218:12324:14aaddb22c3ae:8b9027e676
 ```
 
-这种可以直接粘贴。只有当密码里有 `:`、`@`、`#` 等特殊字符时，才建议使用 `socks5://user:pass@host:port` 格式，并对特殊字符做 URL 编码：
+这种可以直接粘贴。只有当密码里有 `:`、`@`、`#` 等特殊字符时，才建议使用 `socks5://user:pass@host:port` 或 `socks://user:pass@host:port` 格式，并对特殊字符做 URL 编码：
 
 - `:` → `%3A`
 - `@` → `%40`
@@ -318,7 +333,7 @@ A: 大多数代理商给的是 `host:port:user:pass`，例如：
 
 **Q: `xray run -test` 报 `Failed to get format`？**
 
-A: 新版 Xray 对配置文件格式识别更严格，临时配置文件需要 `.json` 后缀。当前脚本已将临时配置统一写成 `/tmp/.xray_config.new.$$.json`。
+A: 新版 Xray 对配置文件格式识别更严格，临时配置文件需要 `.json` 后缀。当前脚本已将临时配置统一写成 `/tmp/.xray_config.new.XXXXXX.json`。
 
 **Q: 启动失败并提示 `permission denied` 读取 `config.json`？**
 
@@ -333,9 +348,12 @@ A: 重新下载覆盖即可。现有配置（Xray config、节点信息、监控
 A: 常用位置：
 
 - 流量数据库：`/root/.xray_traffic_db`
-- 流量采集脚本：`/root/.xray_traffic_record.sh`
+- 流量采集脚本：`/root/.xray_traffic_record.sh`（cron 每 5 分钟运行一次）
 - 监控日志：`/var/log/xray/monitor.log`
 - 监控配置：`/root/.xray_monitor.conf`
+- 监控脚本：`/root/.xray_monitor.sh`（systemd timer 每分钟运行一次）
+
+同类监控告警有 30 分钟冷却时间，短时间内不会重复刷屏。
 
 ---
 
