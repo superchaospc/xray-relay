@@ -31,6 +31,18 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.1 关键改动
+
+- 配置写入采用「临时文件 → `xray run -test` → 备份 → 原子替换 → 重启失败回滚」流程
+- Xray 官方安装脚本默认不再跟随 `main`，必须显式 pin commit 或临时指定 `XRAY_INSTALL_REF=main`
+- SOCKS5 支持常见 `host:port:user:pass` 与 URL 格式，并拒绝控制字符注入
+- 防火墙规则支持 `ufw` / `firewalld` / `nftables` / `iptables`，nftables 会自动持久化
+- 节点备注写入配置元数据 `_remark`，修改端口或重建 `INFO_FILE` 后仍能保留原名称
+- 默认只安装必要依赖，不做整机 `apt upgrade`；需要时可用 `XRAY_FULL_UPGRADE=1`
+- 敏感文件统一 `600` 权限，终端输出可用 `XRAY_REDACT=1` 隐藏 UUID / 密钥中段
+
+---
+
 ## 🧰 系统要求
 
 - 🖥️ Linux x86_64 VPS，root 权限
@@ -42,15 +54,24 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 > 注意：脚本默认只安装必要依赖，不会整机 `apt upgrade`。如果确实想顺带升级系统，可用 `XRAY_FULL_UPGRADE=1` 运行。
 
-常用可选环境变量：
+### 环境变量
+
+常见用法示例：
 
 ```bash
 CLIENT_FP=ios REALITY_SERVER_NAME=www.apple.com REALITY_DEST=www.apple.com:443 /root/xray_deploy.sh
 ```
 
-- `CLIENT_FP`：客户端指纹，默认 `chrome`；iOS 客户端可考虑 `ios` 或 `safari`
-- `REALITY_SERVER_NAME`：VLESS 链接里的 SNI，默认 `www.cloudflare.com`
-- `REALITY_DEST`：Xray REALITY 回源目标，默认跟随 `REALITY_SERVER_NAME:443`
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `XRAY_INSTALL_REF` | `PIN_ME` | `XTLS/Xray-install` 的 ref，推荐填固定 commit SHA；临时测试可设为 `main` |
+| `XRAY_INSTALL_SHA256` | 空 | `install-release.sh` 的 sha256；设置后会强制校验 |
+| `XRAY_FULL_UPGRADE` | `0` | 设为 `1` 时才执行整机升级 |
+| `XRAY_REDACT` | `0` | 设为 `1` 时隐藏终端输出里的 UUID / 密钥中段 |
+| `CLIENT_FP` | `chrome` | 客户端指纹；iOS / Shadowrocket 可考虑 `ios` 或 `safari` |
+| `REALITY_SERVER_NAME` | `www.cloudflare.com` | VLESS 链接里的 SNI |
+| `REALITY_DEST` | `${REALITY_SERVER_NAME}:443` | Xray REALITY 回源目标 |
+| `IP_CACHE_TTL` | `3600` | VPS 公网 IP 缓存秒数，EIP 切换后可临时调小 |
 
 ---
 
@@ -191,6 +212,22 @@ flowchart LR
 
 脚本会尽量让 `/usr/local/etc/xray/config.json` 继承现有 owner/group。某些 Xray service 会以 `nobody` 用户运行，如果配置文件被写成 `root:root 600`，服务会因为 `permission denied` 无法启动；当前脚本已针对这种情况处理。
 
+> 说明：脚本会在 Xray inbound 内写入 `_remark` 字段作为节点名称元数据。当前 Xray 会忽略未知字段；该字段只供脚本在修改端口、删除节点、重建 `/root/xray_nodes_info.txt` 时恢复节点备注使用。
+
+---
+
+## 🔐 安全与副作用
+
+脚本需要 root 权限，会对系统做以下改动：
+
+- 安装必要依赖与 Xray core；默认不执行整机升级
+- 写入 `/usr/local/etc/xray/config.json`，并保留最近 5 份 `config.json.bak.*` 备份
+- 写入 `/etc/sysctl.d/99-xray.conf` 开启 BBR 与网络参数优化
+- 可能创建 1G swap（仅内存较小且无 swap 时）
+- 修改系统防火墙规则，并尽量持久化到对应后端
+- 配置监控报警时会写入 `/root/.msmtprc` 与 `/root/.xray_monitor.conf`，权限为 `600`
+- 启用监控时会写入 `xray-monitor.service` / `xray-monitor.timer`
+
 ---
 
 ## 🧪 测试
@@ -242,6 +279,20 @@ A: 运行菜单 `7) 排错诊断`，会依次检查 Xray 服务状态、端口�
 
 还需要确认云厂商安全组已放行对应 TCP 端口，例如 443、8443 等。脚本只能修改 VPS 系统内的防火墙，不能自动修改云厂商控制台里的安全组。
 
+常用排查命令：
+
+```bash
+systemctl status xray --no-pager -l
+journalctl -u xray -n 30 --no-pager
+xray run -test -config /usr/local/etc/xray/config.json
+```
+
+如果刚改配置后启动失败，脚本会自动尝试回滚。也可以手动查看备份：
+
+```bash
+ls -1t /usr/local/etc/xray/config.json.bak.*
+```
+
 **Q: 安装 Xray 时卡在下载？**
 
 A: 脚本依赖 GitHub 下载官方 Xray 安装脚本，国内部分机器可能被墙。解决方案：
@@ -276,6 +327,15 @@ A: 这通常是 Xray service 以 `nobody` 等非 root 用户运行，但配置�
 **Q: 如何升级到新版本脚本？**
 
 A: 重新下载覆盖即可。现有配置（Xray config、节点信息、监控配置）均独立保存，不会丢失。
+
+**Q: 监控、流量统计日志在哪里？**
+
+A: 常用位置：
+
+- 流量数据库：`/root/.xray_traffic_db`
+- 流量采集脚本：`/root/.xray_traffic_record.sh`
+- 监控日志：`/var/log/xray/monitor.log`
+- 监控配置：`/root/.xray_monitor.conf`
 
 ---
 
