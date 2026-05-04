@@ -30,8 +30,14 @@ CONFIG_BACKUP_KEEP=5
 INFO_FILE="/root/xray_nodes_info.txt"
 SYSCTL_FILE="/etc/sysctl.d/99-xray.conf"
 IP_CACHE_FILE="/root/.xray_vps_ip"
+# VPS 公网 IP 缓存时间（秒）。EIP / 浮动 IP 切换后最多等 1 小时自动刷新。
+IP_CACHE_TTL="${IP_CACHE_TTL:-3600}"
 # 客户端指纹（chrome / firefox / safari / ios / android / edge / random）
 CLIENT_FP="${CLIENT_FP:-chrome}"
+# REALITY 伪装目标，可用环境变量覆盖：
+#   REALITY_SERVER_NAME=www.apple.com REALITY_DEST=www.apple.com:443 bash xray_deploy.sh
+REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.cloudflare.com}"
+REALITY_DEST="${REALITY_DEST:-${REALITY_SERVER_NAME}:443}"
 #
 # === Xray 官方安装脚本来源（供应链安全） ===
 #
@@ -79,7 +85,7 @@ redact() {
 get_ip() {
     if [ -f "$IP_CACHE_FILE" ]; then
         local cache_age=$(( $(date +%s) - $(stat -c %Y "$IP_CACHE_FILE" 2>/dev/null || echo 0) ))
-        if [ "$cache_age" -lt 86400 ]; then
+        if [ "$cache_age" -lt "$IP_CACHE_TTL" ]; then
             local cached_ip
             cached_ip=$(cat "$IP_CACHE_FILE" 2>/dev/null)
             if [ -n "$cached_ip" ]; then
@@ -650,7 +656,7 @@ update_system() {
     if command -v apt &>/dev/null; then
         export DEBIAN_FRONTEND=noninteractive
         apt update -y
-        apt install -y curl python3 iproute2 ca-certificates
+        apt install -y curl python3 iproute2 ca-certificates qrencode
         if [ "${XRAY_FULL_UPGRADE:-0}" = "1" ]; then
             echo -e "  ${YELLOW}XRAY_FULL_UPGRADE=1，执行完整系统升级...${NC}"
             apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
@@ -660,13 +666,13 @@ update_system() {
         fi
         echo -e "  ${GREEN}✓ 依赖已就绪 (apt)${NC}"
     elif command -v dnf &>/dev/null; then
-        dnf install -y curl python3 iproute ca-certificates
+        dnf install -y curl python3 iproute ca-certificates qrencode
         if [ "${XRAY_FULL_UPGRADE:-0}" = "1" ]; then
             dnf update -y
         fi
         echo -e "  ${GREEN}✓ 依赖已就绪 (dnf)${NC}"
     elif command -v yum &>/dev/null; then
-        yum install -y curl python3 iproute ca-certificates
+        yum install -y curl python3 iproute ca-certificates qrencode
         if [ "${XRAY_FULL_UPGRADE:-0}" = "1" ]; then
             yum update -y
         fi
@@ -828,6 +834,8 @@ generate_config() {
     UUID="$UUID" \
     PRIVATE_KEY="$PRIVATE_KEY" \
     SHORT_ID="$SHORT_ID" \
+    REALITY_DEST="$REALITY_DEST" \
+    REALITY_SERVER_NAME="$REALITY_SERVER_NAME" \
     NODES_DATA="$NODES_DATA" \
     python3 << 'PYEOF'
 import json, os
@@ -835,6 +843,8 @@ new_config = os.environ["NEW_CONFIG_FILE"]
 uuid = os.environ["UUID"]
 private_key = os.environ["PRIVATE_KEY"]
 short_id = os.environ["SHORT_ID"]
+reality_dest = os.environ["REALITY_DEST"]
+reality_server_name = os.environ["REALITY_SERVER_NAME"]
 raw_nodes = [line for line in os.environ["NODES_DATA"].splitlines() if line.strip()]
 
 inbounds = [{"tag":"api-in","port":10085,"listen":"127.0.0.1","protocol":"dokodemo-door","settings":{"address":"127.0.0.1"}}]
@@ -852,7 +862,7 @@ for idx, node in enumerate(raw_nodes, start=1):
         "tag": tag_in, "port": int(port), "protocol": "vless",
         "settings": {"clients":[{"id":uuid,"flow":"xtls-rprx-vision"}],"decryption":"none"},
         "streamSettings": {"network":"tcp","security":"reality",
-            "realitySettings":{"dest":"www.microsoft.com:443","serverNames":["www.microsoft.com"],
+            "realitySettings":{"dest":reality_dest,"serverNames":[reality_server_name],
                 "privateKey":private_key,"shortIds":[short_id]},
             "sockopt":{"tcpFastOpen":True,"tcpNoDelay":True}},
         "sniffing":{"enabled":True,"destOverride":["http","tls"]}
@@ -987,7 +997,7 @@ print_result() {
 
     for i in "${!NODES[@]}"; do
         IFS=$'\x1f' read -r PORT S_HOST S_PORT S_USER S_PASS NAME <<< "${NODES[$i]}"
-        LINK="vless://${UUID}@${VPS_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NAME}"
+        LINK="vless://${UUID}@${VPS_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NAME}"
 
         echo -e "${GREEN}━━━ ${NAME} ━━━${NC}"
         echo -e "  监听端口: ${PORT}"
@@ -1068,6 +1078,7 @@ PYEOF
     PUBLIC_KEY="$PUBLIC_KEY" \
     SHORT_ID="$SHORT_ID" \
     CLIENT_FP="$CLIENT_FP" \
+    REALITY_SERVER_NAME="$REALITY_SERVER_NAME" \
     REFRESH_NAME_PORT="${REFRESH_NAME_PORT:-}" \
     REFRESH_NAME="${REFRESH_NAME:-}" \
     python3 << 'PYEOF'
@@ -1082,6 +1093,7 @@ uuid = os.environ["UUID"]
 public_key = os.environ["PUBLIC_KEY"]
 short_id = os.environ["SHORT_ID"]
 client_fp = os.environ["CLIENT_FP"]
+reality_server_name = os.environ["REALITY_SERVER_NAME"]
 
 old_names = {}
 if os.path.exists(info_file):
@@ -1143,7 +1155,7 @@ for inb in config.get("inbounds", []):
     link = (
         f"vless://{uuid}@{vps_ip}:{port}"
         f"?encryption=none&flow=xtls-rprx-vision&security=reality"
-        f"&sni=www.microsoft.com&fp={client_fp}&pbk={public_key}"
+        f"&sni={reality_server_name}&fp={client_fp}&pbk={public_key}"
         f"&sid={short_id}&type=tcp#{safe_name}"
     )
     lines.extend([f"=== {safe_name} ===", f"端口: {port}", dest_line, f"链接: {link}", ""])
@@ -1206,6 +1218,7 @@ add_node() {
     if ! NEW_CONFIG_FILE="$NEW_CONFIG" \
         TAG_NUM="$TAG_NUM" NEW_PORT="$NEW_PORT" UUID="$UUID" \
         PRIVATE_KEY="$PRIVATE_KEY" SHORT_ID="$SHORT_ID" \
+        REALITY_DEST="$REALITY_DEST" REALITY_SERVER_NAME="$REALITY_SERVER_NAME" \
         S_HOST="$S_HOST" S_PORT="$S_PORT" S_USER="$S_USER" S_PASS="$S_PASS" \
         python3 << 'PYEOF'
 import json, os, sys
@@ -1215,6 +1228,8 @@ new_port = int(os.environ["NEW_PORT"])
 uuid = os.environ["UUID"]
 private_key = os.environ["PRIVATE_KEY"]
 short_id = os.environ["SHORT_ID"]
+reality_dest = os.environ["REALITY_DEST"]
+reality_server_name = os.environ["REALITY_SERVER_NAME"]
 s_host = os.environ["S_HOST"]
 try:
     s_port = int(os.environ["S_PORT"])
@@ -1226,28 +1241,34 @@ s_pass = os.environ["S_PASS"]
 with open(new_config) as f:
     config = json.load(f)
 
-config["inbounds"].append({
+config.setdefault("inbounds", []).append({
     "tag": f"vless-in-{tag_num}", "port": new_port, "protocol": "vless",
     "settings": {"clients":[{"id":uuid,"flow":"xtls-rprx-vision"}],"decryption":"none"},
     "streamSettings": {"network":"tcp","security":"reality",
-        "realitySettings":{"dest":"www.microsoft.com:443","serverNames":["www.microsoft.com"],
+        "realitySettings":{"dest":reality_dest,"serverNames":[reality_server_name],
             "privateKey":private_key,"shortIds":[short_id]},
         "sockopt":{"tcpFastOpen":True,"tcpNoDelay":True}},
     "sniffing":{"enabled":True,"destOverride":["http","tls"]}
 })
+
+outbounds = config.setdefault("outbounds", [])
+if not any(ob.get("tag") == "direct" for ob in outbounds):
+    outbounds.append({"tag":"direct","protocol":"freedom"})
+if not any(ob.get("tag") == "block" for ob in outbounds):
+    outbounds.append({"tag":"block","protocol":"blackhole"})
 
 new_out = {
     "tag": f"socks5-out-{tag_num}", "protocol": "socks",
     "settings":{"servers":[{"address":s_host,"port":s_port,"users":[{"user":s_user,"pass":s_pass}]}]},
     "streamSettings":{"sockopt":{"tcpFastOpen":True,"tcpNoDelay":True}}
 }
-for idx, ob in enumerate(config["outbounds"]):
+for idx, ob in enumerate(outbounds):
     if ob.get("tag") == "direct":
-        config["outbounds"].insert(idx, new_out); break
+        outbounds.insert(idx, new_out); break
 else:
-    config["outbounds"].append(new_out)
+    outbounds.append(new_out)
 
-config["routing"]["rules"].append(
+config.setdefault("routing", {}).setdefault("rules", []).append(
     {"type":"field","inboundTag":[f"vless-in-{tag_num}"],"outboundTag":f"socks5-out-{tag_num}"})
 
 with open(new_config, "w") as f:
@@ -1267,7 +1288,7 @@ PYEOF
     apply_firewall_port_capture "$NEW_PORT"
 
     if restart_with_rollback; then
-        LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
+        LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
         echo ""
         echo -e "${GREEN}✓ 节点添加成功！${NC}"
         echo -e "${GREEN}端口: ${NEW_PORT}${NC}"
@@ -1321,28 +1342,33 @@ add_direct_node() {
     if ! NEW_CONFIG_FILE="$NEW_CONFIG" \
         TAG_NUM="$TAG_NUM" NEW_PORT="$NEW_PORT" UUID="$UUID" \
         PRIVATE_KEY="$PRIVATE_KEY" SHORT_ID="$SHORT_ID" \
+        REALITY_DEST="$REALITY_DEST" REALITY_SERVER_NAME="$REALITY_SERVER_NAME" \
         python3 << 'PYEOF'
 import json, os
 new_config = os.environ["NEW_CONFIG_FILE"]
 tag_num = os.environ["TAG_NUM"]
 new_port = int(os.environ["NEW_PORT"])
 uuid = os.environ["UUID"]; private_key = os.environ["PRIVATE_KEY"]; short_id = os.environ["SHORT_ID"]
+reality_dest = os.environ["REALITY_DEST"]; reality_server_name = os.environ["REALITY_SERVER_NAME"]
 
 with open(new_config) as f:
     config = json.load(f)
 
-config["inbounds"].append({
+config.setdefault("inbounds", []).append({
     "tag": f"vless-in-{tag_num}", "port": new_port, "protocol": "vless",
     "settings": {"clients":[{"id":uuid,"flow":"xtls-rprx-vision"}],"decryption":"none"},
     "streamSettings": {"network":"tcp","security":"reality",
-        "realitySettings":{"dest":"www.microsoft.com:443","serverNames":["www.microsoft.com"],
+        "realitySettings":{"dest":reality_dest,"serverNames":[reality_server_name],
             "privateKey":private_key,"shortIds":[short_id]},
         "sockopt":{"tcpFastOpen":True,"tcpNoDelay":True}},
     "sniffing":{"enabled":True,"destOverride":["http","tls"]}
 })
 
-if not any(ob.get("tag")=="direct" for ob in config.get("outbounds",[])):
-    config.setdefault("outbounds",[]).append({"tag":"direct","protocol":"freedom"})
+outbounds = config.setdefault("outbounds", [])
+if not any(ob.get("tag")=="direct" for ob in outbounds):
+    outbounds.append({"tag":"direct","protocol":"freedom"})
+if not any(ob.get("tag")=="block" for ob in outbounds):
+    outbounds.append({"tag":"block","protocol":"blackhole"})
 
 config.setdefault("routing",{}).setdefault("rules",[]).append(
     {"type":"field","inboundTag":[f"vless-in-{tag_num}"],"outboundTag":"direct"})
@@ -1363,7 +1389,7 @@ PYEOF
     apply_firewall_port_capture "$NEW_PORT"
 
     if restart_with_rollback; then
-        LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
+        LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
         echo ""
         echo -e "${GREEN}✓ VPS 直连节点添加成功！${NC}"
         echo -e "${GREEN}端口: ${NEW_PORT}${NC}"
@@ -1508,9 +1534,13 @@ for inb in config.get("inbounds", []):
     port = inb.get("port", 0)
     cur_up = get_stat(f"inbound>>>{tag}>>>traffic>>>uplink")
     cur_down = get_stat(f"inbound>>>{tag}>>>traffic>>>downlink")
-    prev_up, prev_down = last_cum.get(tag, (0, 0))
-    delta_up = cur_up if cur_up < prev_up else cur_up - prev_up
-    delta_down = cur_down if cur_down < prev_down else cur_down - prev_down
+    if tag not in last_cum:
+        delta_up = 0
+        delta_down = 0
+    else:
+        prev_up, prev_down = last_cum[tag]
+        delta_up = cur_up if cur_up < prev_up else cur_up - prev_up
+        delta_down = cur_down if cur_down < prev_down else cur_down - prev_down
     new_rows.append(f"{timestamp}|{tag}|{port}|{cur_up}|{cur_down}|{delta_up}|{delta_down}")
 
 # 用 'a' 模式但创建时设置权限
@@ -1748,7 +1778,7 @@ PYEOF
         VPS_IP=$(get_ip)
         load_node_identity
         PUBLIC_KEY=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -i "public" | awk '{print $NF}')
-        NEW_LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Port-${NEW_PORT}"
+        NEW_LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#Port-${NEW_PORT}"
         echo -e "${YELLOW}新链接:${NC} ${NEW_LINK}"
         refresh_info_file_from_config || true
         show_qrcode "$NEW_LINK" "Port-${NEW_PORT}"
@@ -1891,12 +1921,16 @@ for inb in cfg.get('inbounds',[]):
 
     echo ""
     echo -e "${GREEN}[3/8] 端口监听检查${NC}"
+    PORTS=""
     if [ -f "$CONFIG_FILE" ]; then
         PORTS=$(python3 -c "
 import json
 cfg = json.load(open('$CONFIG_FILE'))
 for inb in cfg.get('inbounds',[]):
-    print(inb.get('port',''))" 2>/dev/null)
+    print(inb.get('port',''))" 2>/dev/null || true)
+        if [ -z "$PORTS" ]; then
+            echo -e "  ${YELLOW}⚠ 无法解析端口列表，跳过端口监听检查${NC}"
+        fi
         for PORT in $PORTS; do
             if ss -tlnp | grep -q ":${PORT} "; then
                 echo -e "  ${GREEN}✓ 端口 ${PORT} 正在监听${NC}"
@@ -1908,7 +1942,9 @@ for inb in cfg.get('inbounds',[]):
 
     echo ""
     echo -e "${GREEN}[4/8] 防火墙检查${NC}"
-    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if [ -z "${PORTS:-}" ]; then
+        echo -e "  ${YELLOW}⚠ 无法解析端口列表，跳过防火墙检查${NC}"
+    elif command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
         UFW_STATUS=$(ufw status 2>/dev/null | head -1)
         echo -e "  UFW: ${UFW_STATUS}"
         if [ -f "$CONFIG_FILE" ]; then
@@ -2443,11 +2479,11 @@ preflight_check() {
         if command -v apt &>/dev/null; then
             export DEBIAN_FRONTEND=noninteractive
             apt update -y >/dev/null 2>&1 || true
-            apt install -y python3 curl iproute2 >/dev/null 2>&1 || true
+            apt install -y python3 curl iproute2 qrencode >/dev/null 2>&1 || true
         elif command -v dnf &>/dev/null; then
-            dnf install -y python3 curl iproute >/dev/null 2>&1 || true
+            dnf install -y python3 curl iproute qrencode >/dev/null 2>&1 || true
         elif command -v yum &>/dev/null; then
-            yum install -y python3 curl iproute >/dev/null 2>&1 || true
+            yum install -y python3 curl iproute qrencode >/dev/null 2>&1 || true
         fi
         for cmd in python3 curl ss; do
             if ! command -v "$cmd" &>/dev/null; then

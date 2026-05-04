@@ -14,19 +14,19 @@ cat > "$INFO_FILE" << 'EOF'
 === LA-CMIN2 ===
 端口: 443
 出口: VPS 直连 (38.47.118.82)
-链接: vless://abc-uuid@38.47.118.82:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=PUBKEY&sid=SID&type=tcp#LA-CMIN2
+链接: vless://abc-uuid@38.47.118.82:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.cloudflare.com&fp=chrome&pbk=PUBKEY&sid=SID&type=tcp#LA-CMIN2
 
 
 === US-Residential ===
 端口: 8444
 落地: 161.77.77.5:12324
-链接: vless://abc-uuid@38.47.118.82:8444?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=PUBKEY&sid=SID&type=tcp#US-Residential
+链接: vless://abc-uuid@38.47.118.82:8444?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.cloudflare.com&fp=chrome&pbk=PUBKEY&sid=SID&type=tcp#US-Residential
 
 
 === JP-Direct ===
 端口: 8445
 出口: VPS 直连 (38.47.118.82)
-链接: vless://abc-uuid@38.47.118.82:8445?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=PUBKEY&sid=SID&type=tcp#JP-Direct
+链接: vless://abc-uuid@38.47.118.82:8445?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.cloudflare.com&fp=chrome&pbk=PUBKEY&sid=SID&type=tcp#JP-Direct
 
 EOF
 

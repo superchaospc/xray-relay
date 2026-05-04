@@ -15,7 +15,7 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ## ✨ 功能特性
 
-- 🔐 **VLESS + REALITY + XTLS-Vision** 满血配置，伪装目标为 `www.microsoft.com`
+- 🔐 **VLESS + REALITY + XTLS-Vision** 满血配置，默认伪装目标为 `www.cloudflare.com`，可用环境变量覆盖
 - 🌉 **中转架构**：VPS 入口 → 前置 SOCKS5（住宅 IP）出口，也支持纯 VPS 直连模式
 - 🎯 **固定端口映射**：每个前置节点绑定独立监听端口，客户端可精确选择出口，不做负载均衡
 - 🧩 **多节点管理**：菜单化添加、删除节点，修改端口
@@ -38,9 +38,19 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - ⚙️ 内核 ≥ 4.9（支持 BBR，绝大多数现代发行版默认满足）
 - 🌐 出站 443 可访问 GitHub（用于首次下载官方 Xray 安装脚本）
 
-脚本会自动检测并安装依赖：`xray-core`、`python3`、`curl`、`iproute2`、`qrencode`（懒加载）、`msmtp`（仅配置邮件时）。
+脚本会自动检测并安装依赖：`xray-core`、`python3`、`curl`、`iproute2`、`qrencode`、`msmtp`（仅配置邮件时）。
 
 > 注意：脚本默认只安装必要依赖，不会整机 `apt upgrade`。如果确实想顺带升级系统，可用 `XRAY_FULL_UPGRADE=1` 运行。
+
+常用可选环境变量：
+
+```bash
+CLIENT_FP=ios REALITY_SERVER_NAME=www.apple.com REALITY_DEST=www.apple.com:443 /root/xray_deploy.sh
+```
+
+- `CLIENT_FP`：客户端指纹，默认 `chrome`；iOS 客户端可考虑 `ios` 或 `safari`
+- `REALITY_SERVER_NAME`：VLESS 链接里的 SNI，默认 `www.cloudflare.com`
+- `REALITY_DEST`：Xray REALITY 回源目标，默认跟随 `REALITY_SERVER_NAME:443`
 
 ---
 
