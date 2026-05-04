@@ -1199,9 +1199,6 @@ add_node() {
         echo -e "${RED}${NEW_PORT:-ERROR: 无法计算下一个监听端口}${NC}"
         return
     fi
-    if [[ "$NEW_PORT" == ERROR:* ]]; then
-        echo -e "${RED}${NEW_PORT}${NC}"; return
-    fi
     while port_in_use "$NEW_PORT"; do
         NEW_PORT=$((NEW_PORT + 1))
         if [ "$NEW_PORT" -gt 20000 ]; then
@@ -1335,9 +1332,6 @@ add_direct_node() {
     if ! NEW_PORT=$(get_next_inbound_port); then
         echo -e "${RED}${NEW_PORT:-ERROR: 无法计算下一个监听端口}${NC}"
         return
-    fi
-    if [[ "$NEW_PORT" == ERROR:* ]]; then
-        echo -e "${RED}${NEW_PORT}${NC}"; return
     fi
     while port_in_use "$NEW_PORT"; do
         NEW_PORT=$((NEW_PORT + 1))
@@ -2245,7 +2239,7 @@ log() { echo "[$NOW] $1" >> "$MONITOR_LOG"; }
 send_alert() {
     local SUBJECT="$1" BODY="$2"
     local LOCK_KEY
-    LOCK_KEY=$(printf "%s" "$BODY" | md5sum | cut -d' ' -f1)
+    LOCK_KEY=$(printf "%s" "$BODY" | sed -E 's/[0-9]+/N/g' | md5sum | cut -d' ' -f1)
     local LOCK_FILE="${ALERT_LOCK}_${LOCK_KEY}"
     if [ -f "$LOCK_FILE" ]; then
         local AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
