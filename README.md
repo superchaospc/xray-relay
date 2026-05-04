@@ -154,14 +154,23 @@ curl -fsSL https://raw.githubusercontent.com/superchaospc/xray-relay/main/xray_d
 
 ## 🏗️ 架构说明
 
-```
-                       ┌────────────────────────────────┐
-                       │   VPS (Xray VLESS+REALITY)     │
-客户端                   │                                │
-Shadowrocket    ──────▶│  入口端口 A ──▶ SOCKS5 节点 1   │──▶ 住宅 IP 1
-V2rayN / NG            │  入口端口 B ──▶ SOCKS5 节点 2   │──▶ 住宅 IP 2
-                       │  入口端口 C ──▶ VPS 直连出口    │──▶ 机房 IP
-                       └────────────────────────────────┘
+```mermaid
+flowchart LR
+    client["客户端<br/>Shadowrocket<br/>V2rayN / V2rayNG / NekoBox"]
+
+    subgraph vps["VPS · Xray VLESS + REALITY"]
+        inA["入口端口 A"] --> socks1["SOCKS5 节点 1"]
+        inB["入口端口 B"] --> socks2["SOCKS5 节点 2"]
+        inC["入口端口 C"] --> direct["VPS 直连出口"]
+    end
+
+    client --> inA
+    client --> inB
+    client --> inC
+
+    socks1 --> home1["住宅 IP 1"]
+    socks2 --> home2["住宅 IP 2"]
+    direct --> dc["机房 IP"]
 ```
 
 - 每个入口端口对应一个出口（一对一固定映射），客户端通过连接不同端口选择出口节点
