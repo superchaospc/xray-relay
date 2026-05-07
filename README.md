@@ -41,6 +41,7 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - systemd drop-in 自动提升 Xray 文件描述符上限到 `65535`
 - 默认只安装必要依赖，不做整机 `apt upgrade`；需要时可用 `XRAY_FULL_UPGRADE=1`
 - 敏感文件统一 `600` 权限，终端输出可用 `XRAY_REDACT=1` 隐藏 UUID / 密钥中段
+- `config.json` 写入后强制 `644 root:root`，避免老文件错误权限被新写入继承导致 Xray (nobody) 启动失败
 
 ---
 
@@ -216,7 +217,7 @@ flowchart LR
 | `/root/.xray_monitor.sh` | 监控巡检脚本 |
 | `/var/log/xray/` | Xray 运行日志 |
 
-脚本会尽量让 `/usr/local/etc/xray/config.json` 继承现有 owner/group。某些 Xray service 会以 `nobody` 用户运行，如果配置文件被写成 `root:root 600`，服务会因为 `permission denied` 无法启动；当前脚本已针对这种情况处理。
+`/usr/local/etc/xray/config.json` 由脚本写入后会强制设置为 `644 root:root`。这是因为 Xray service 默认以 `nobody` 用户运行，若配置文件是 `root:root 600`，nobody 用户会因 `permission denied` 无法读取而启动失败。父目录 `/usr/local/etc/xray/` 默认权限为 `755`，只有 root 能进入，因此即便文件本身是 `644` 也不会泄露给非特权本地用户。
 
 > 说明：脚本会在 Xray inbound 内写入 `_remark` 字段作为节点名称元数据。当前 Xray 会忽略未知字段；该字段只供脚本在修改端口、删除节点、重建 `/root/xray_nodes_info.txt` 时恢复节点备注使用。
 
@@ -337,7 +338,9 @@ A: 新版 Xray 对配置文件格式识别更严格，临时配置文件需要 `
 
 **Q: 启动失败并提示 `permission denied` 读取 `config.json`？**
 
-A: 这通常是 Xray service 以 `nobody` 等非 root 用户运行，但配置文件是 `root:root 600`。当前脚本会继承现有配置的 owner/group，并保持 `600` 权限，避免泄露配置又保证服务可读。
+A: 这通常是 Xray service 以 `nobody` 等非 root 用户运行，但配置文件被写成了 `root:root 600`。当前脚本会强制把新写入的 `config.json` 设为 `644 root:root`，确保 nobody 可读。父目录 `/usr/local/etc/xray/` 默认权限 `755` 只有 root 能进入，所以 `644` 不会泄露给非特权本地用户。
+
+历史教训：早期版本曾尝试「继承现有文件 owner/group」，但一旦初始文件意外是 `600 root:root`（比如 root umask 077 下用 Python `open('w')` 写出来的），后续每次写新配置都会延续这个错误，nobody 永远读不到。详见 [commit f28238c](https://github.com/superchaospc/xray-relay/commit/f28238c)。
 
 **Q: 如何升级到新版本脚本？**
 
