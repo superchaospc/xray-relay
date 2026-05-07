@@ -1518,7 +1518,36 @@ show_status() {
 # ========== 流量统计（保持原逻辑，仅敏感文件加权限） ==========
 TRAFFIC_DB="/root/.xray_traffic_db"
 
+# 确保 cron 守护进程已安装并运行
+# 某些精简发行版（如 Debian minimal）默认不带 cron / cronie，
+# 历史教训：脚本菜单 6) 流量统计直接报 "crontab: command not found"
+ensure_cron_installed() {
+    if command -v crontab &>/dev/null; then
+        return 0
+    fi
+    echo -e "${YELLOW}⚠ 未检测到 crontab，正在自动安装 cron...${NC}"
+    if command -v apt-get &>/dev/null; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y >/dev/null 2>&1 || true
+        apt-get install -y cron >/dev/null 2>&1 || true
+        systemctl enable --now cron >/dev/null 2>&1 || true
+    elif command -v dnf &>/dev/null; then
+        dnf install -y cronie >/dev/null 2>&1 || true
+        systemctl enable --now crond >/dev/null 2>&1 || true
+    elif command -v yum &>/dev/null; then
+        yum install -y cronie >/dev/null 2>&1 || true
+        systemctl enable --now crond >/dev/null 2>&1 || true
+    fi
+    if ! command -v crontab &>/dev/null; then
+        echo -e "${RED}✗ 无法自动安装 cron，请手动执行: apt install cron 或 yum install cronie${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}✓ cron 已安装并启动${NC}"
+    return 0
+}
+
 setup_traffic_cron() {
+    ensure_cron_installed || return 1
     CRON_SCRIPT="/root/.xray_traffic_record.sh"
     cat > "$CRON_SCRIPT" << 'CRONEOF'
 #!/bin/bash
@@ -2548,6 +2577,11 @@ preflight_check() {
             fi
         done
         echo -e "${GREEN}✓ 依赖已就绪${NC}"
+    fi
+
+    # cron 不是硬依赖（仅菜单 6/10 需要），只提示不阻塞；真正用到时由 ensure_cron_installed 再装
+    if ! command -v crontab &>/dev/null; then
+        echo -e "${YELLOW}ℹ 未安装 cron，使用流量统计/监控报警时会自动安装${NC}"
     fi
 
     # 443 端口占用检查（提示性，不阻塞）
