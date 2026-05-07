@@ -350,13 +350,11 @@ validate_and_install_config() {
         echo -e "${YELLOW}⚠ xray 二进制尚未安装，跳过 -test 校验${NC}"
     fi
 
-    # 继承现有配置的 owner/group；xray.service 可能以 nobody 运行，root:root 600 会导致 permission denied
-    local config_owner_group="root:root"
-    if [ -f "$CONFIG_FILE" ]; then
-        config_owner_group=$(stat -c "%U:%G" "$CONFIG_FILE" 2>/dev/null || echo "root:root")
-    elif id nobody >/dev/null 2>&1; then
-        config_owner_group="nobody:nogroup"
-    fi
+    # config.json 必须让 xray 服务用户(nobody)能读
+    # 历史教训：盲目继承现有文件 owner/group 会延续错误（一旦老文件是 600 root:root，
+    # 新文件继续 600，nobody 永远读不到，启动 permission denied）
+    # 直接强制 644 root:root：/usr/local/etc/xray/ 目录默认 755 只有 root 能进入，
+    # 即便文件 644 也不会泄露给非特权本地用户
 
     # 备份原配置
     if [ -f "$CONFIG_FILE" ]; then
@@ -370,10 +368,10 @@ validate_and_install_config() {
         echo -e "  ✓ 已备份原配置: $backup"
     fi
 
-    # 原子替换
+    # 原子替换 + 强制权限到 nobody 可读
     mv "$new_config" "$CONFIG_FILE"
-    chown "$config_owner_group" "$CONFIG_FILE" 2>/dev/null || true
-    chmod 600 "$CONFIG_FILE"
+    chown root:root "$CONFIG_FILE" 2>/dev/null || true
+    chmod 644 "$CONFIG_FILE"
     return 0
 }
 
