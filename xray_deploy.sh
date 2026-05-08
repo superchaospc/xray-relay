@@ -2116,6 +2116,7 @@ PYEOF
     if [ -n "$RECENT" ]; then
         echo -e "  ${YELLOW}发现错误:${NC}"
         echo "$RECENT" | sed 's/^/    /'
+        ERRORS=$((ERRORS+1))
     else
         echo -e "  ${GREEN}✓ 最近1小时无错误${NC}"
     fi
