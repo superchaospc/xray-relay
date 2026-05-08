@@ -1572,7 +1572,16 @@ def get_stat(name):
     try:
         result = subprocess.run([xray_bin,"api","stats","--server=127.0.0.1:10085",f"-name={name}"],
                                 capture_output=True, text=True, timeout=5)
-        for line in result.stdout.strip().split("\n"):
+        out = result.stdout.strip()
+        if not out:
+            return 0
+        if out.startswith("{"):
+            try:
+                import json as _json
+                v = _json.loads(out).get("stat", {}).get("value", 0)
+                return int(v) if v else 0
+            except Exception: pass
+        for line in out.split("\n"):
             if "value:" in line.lower():
                 val = line.split(":")[-1].strip()
                 return int(val) if val else 0
@@ -1664,7 +1673,16 @@ def get_stat(name):
     try:
         r = subprocess.run([xray_bin,"api","stats","--server=127.0.0.1:10085",f"-name={name}"],
                            capture_output=True, text=True, timeout=5)
-        for line in r.stdout.strip().split("\n"):
+        out = r.stdout.strip()
+        if not out:
+            return 0
+        if out.startswith("{"):
+            try:
+                import json as _json
+                v = _json.loads(out).get("stat", {}).get("value", 0)
+                return int(v) if v else 0
+            except Exception: pass
+        for line in out.split("\n"):
             if "value:" in line.lower():
                 v = line.split(":")[-1].strip()
                 return int(v) if v else 0
