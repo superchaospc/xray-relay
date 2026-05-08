@@ -2139,7 +2139,7 @@ uninstall() {
         rm -rf /etc/systemd/system/xray.service.d
         systemctl daemon-reload 2>/dev/null || true
         (crontab -l 2>/dev/null || true) | grep -v "xray_traffic_record" | crontab - 2>/dev/null || true
-        rm -f "$INFO_FILE" "$SYSCTL_FILE" /root/.xray_traffic_db /root/.xray_traffic_record.sh \
+        rm -f "$CONFIG_FILE" "$INFO_FILE" "$SYSCTL_FILE" /root/.xray_traffic_db /root/.xray_traffic_record.sh \
               /root/.xray_monitor.conf /root/.xray_monitor.sh /root/.xray_vps_ip /root/.msmtprc \
               /tmp/.xray_node_failures /tmp/.xray_alert_lock_*
         # 配置备份保留，让用户决定是否清理
