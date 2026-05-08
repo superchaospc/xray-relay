@@ -6,7 +6,7 @@
 #  v2.1 改进点（基于 code review）：
 #    - 配置写入采用 备份 → 临时文件 → xray -test → 原子替换 → 失败回滚 流程
 #    - 编号无效等校验失败时不再触发 firewall / 重启
-#    - Xray 官方安装脚本默认 pin 到固定 commit，可通过 XRAY_INSTALL_REF 覆盖
+#    - Xray 官方安装脚本默认使用 main，可通过 XRAY_INSTALL_REF pin 到固定 commit
 #    - SOCKS5 输入支持 host:port:user:pass 常见格式，也支持 socks5:// URL 特殊字符格式
 #    - 系统升级与依赖安装拆分（默认仅装依赖，XRAY_FULL_UPGRADE=1 才整机升级）
 #    - 防火墙规则去重 + nftables 检测 + 安全组提示
@@ -41,8 +41,8 @@ REALITY_DEST="${REALITY_DEST:-${REALITY_SERVER_NAME}:443}"
 #
 # === Xray 官方安装脚本来源（供应链安全） ===
 #
-# 默认值故意设成 PIN_ME，脚本启动时会拒绝继续，强迫你做选择：
-#   选项 A（推荐，生产）：把 XRAY_INSTALL_REF_DEFAULT 改成你审计过的具体 commit SHA：
+# 默认使用 XTLS/Xray-install 的 main 分支，方便一键部署到新 VPS。
+# 生产环境推荐把 XRAY_INSTALL_REF_DEFAULT 改成你审计过的具体 commit SHA：
 #     XRAY_INSTALL_REF_DEFAULT="2f37cdc7a76ab8d6a5e3a7f0e5d2cafe..."
 #     可选附加 sha256 校验：
 #     XRAY_INSTALL_SHA256_DEFAULT="<sha256 of install-release.sh at that commit>"
@@ -50,9 +50,7 @@ REALITY_DEST="${REALITY_DEST:-${REALITY_SERVER_NAME}:443}"
 #       git ls-remote https://github.com/XTLS/Xray-install.git refs/heads/main
 #       curl -L https://raw.githubusercontent.com/XTLS/Xray-install/<COMMIT>/install-release.sh \
 #         | sha256sum
-#   选项 B（一次性，逃生）：环境变量临时用 main 分支
-#     XRAY_INSTALL_REF=main bash xray_deploy.sh
-XRAY_INSTALL_REF_DEFAULT="PIN_ME"
+XRAY_INSTALL_REF_DEFAULT="main"
 XRAY_INSTALL_SHA256_DEFAULT=""
 XRAY_INSTALL_REF="${XRAY_INSTALL_REF:-$XRAY_INSTALL_REF_DEFAULT}"
 XRAY_INSTALL_SHA256="${XRAY_INSTALL_SHA256:-$XRAY_INSTALL_SHA256_DEFAULT}"
@@ -164,15 +162,11 @@ run_xray_installer() {
     local ref="$XRAY_INSTALL_REF"
     local expected_sha="$XRAY_INSTALL_SHA256"
 
-    # 拒绝 PIN_ME 占位符——强迫用户做出选择
-    if [ "$ref" = "PIN_ME" ] || [ -z "$ref" ]; then
+    # 拒绝空 ref，避免拼出无意义的 raw URL
+    if [ -z "$ref" ]; then
         echo -e "${RED}✗ Xray 安装脚本来源未配置${NC}"
-        echo -e "${YELLOW}  需要选择以下之一才能继续：${NC}"
-        echo -e "${YELLOW}    1) 编辑脚本顶部，把 XRAY_INSTALL_REF_DEFAULT 改成具体 commit SHA${NC}"
-        echo -e "${YELLOW}       (推荐附加 XRAY_INSTALL_SHA256_DEFAULT 校验)${NC}"
-        echo -e "${YELLOW}    2) 临时一次性使用 main 分支：${NC}"
-        echo -e "${YELLOW}       XRAY_INSTALL_REF=main bash xray_deploy.sh${NC}"
-        echo -e "${YELLOW}  查询当前 main 的 commit SHA：${NC}"
+        echo -e "${YELLOW}  请设置 XRAY_INSTALL_REF=main，或指定 XTLS/Xray-install 的具体 commit SHA。${NC}"
+        echo -e "${YELLOW}  查询当前 main 的 commit SHA 可用：${NC}"
         echo -e "${YELLOW}    git ls-remote https://github.com/XTLS/Xray-install.git refs/heads/main${NC}"
         return 1
     fi

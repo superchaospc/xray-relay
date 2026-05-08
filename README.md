@@ -21,7 +21,7 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🧩 **多节点管理**：菜单化添加、删除节点，修改端口
 - 🛟 **安全写配置**：生成临时 JSON → `xray run -test` 校验 → 备份旧配置 → 原子替换 → 启动失败自动回滚
 - 🧱 **自动防火墙放行**：依次尝试 `ufw` / `firewalld` / `nftables` / `iptables`，并尽量持久化规则，对云厂商安全组给出提醒
-- 🔒 **供应链保护**：默认拒绝未确认的 Xray 官方安装脚本来源，支持固定 commit 与 sha256 校验
+- 🔒 **供应链保护**：默认使用 Xray 官方安装脚本 `main` 分支，支持固定 commit 与 sha256 校验
 - ⚡ **BBR 加速**：自动开启 BBR 拥塞控制并写入内核调优参数
 - 📊 **流量统计**：基于 Xray API 的累计上行/下行流量查看
 - 🩺 **排错诊断**：一键检查服务、配置、端口、防火墙、前置连通性、BBR、系统资源和错误日志
@@ -34,7 +34,7 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 ## 🆕 v2.1 关键改动
 
 - 配置写入采用「临时文件 → `xray run -test` → 备份 → 原子替换 → 重启失败回滚」流程
-- Xray 官方安装脚本默认不再跟随 `main`，必须显式 pin commit 或临时指定 `XRAY_INSTALL_REF=main`
+- Xray 官方安装脚本默认跟随 `main`，新 VPS 可直接一键部署；生产环境仍建议显式 pin commit 和 sha256
 - SOCKS5 支持常见 `host:port:user:pass` 与 URL 格式，并拒绝控制字符注入
 - 防火墙规则支持 `ufw` / `firewalld` / `nftables` / `iptables`，nftables 与 iptables 会尝试自动持久化
 - 节点备注写入配置元数据 `_remark`，修改端口或重建 `INFO_FILE` 后仍能保留原名称
@@ -66,7 +66,7 @@ CLIENT_FP=ios REALITY_SERVER_NAME=www.apple.com REALITY_DEST=www.apple.com:443 /
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `XRAY_INSTALL_REF` | `PIN_ME` | `XTLS/Xray-install` 的 ref，推荐填固定 commit SHA；临时测试可设为 `main` |
+| `XRAY_INSTALL_REF` | `main` | `XTLS/Xray-install` 的 ref；生产环境推荐填固定 commit SHA |
 | `XRAY_INSTALL_SHA256` | 空 | `install-release.sh` 的 sha256；设置后会强制校验 |
 | `XRAY_FULL_UPGRADE` | `0` | 设为 `1` 时才执行整机升级 |
 | `XRAY_REDACT` | `0` | 设为 `1` 时隐藏终端输出里的 UUID / 密钥中段 |
@@ -87,7 +87,7 @@ chmod +x /root/xray_deploy.sh
 /root/xray_deploy.sh
 ```
 
-首次选择 `1) 全新安装` 或 `8) 更新 Xray` 时，脚本会要求你明确配置 Xray 官方安装脚本来源。默认值是 `PIN_ME`，这不是错误，而是为了避免生产环境直接执行远端 `main` 分支。
+首次选择 `1) 全新安装` 或 `8) 更新 Xray` 时，脚本会默认使用 Xray 官方安装脚本的 `main` 分支，因此新 VPS 可以直接安装。运行时会提示当前使用的是追新模式；生产环境建议改用下面的固定 commit 方式。
 
 ### 生产安全模式
 
@@ -106,9 +106,9 @@ XRAY_INSTALL_REF_DEFAULT="<COMMIT>"
 XRAY_INSTALL_SHA256_DEFAULT="<sha256>"
 ```
 
-### 临时追新模式
+### 显式追新模式
 
-如果只是测试，或你接受直接跟随官方安装脚本 `main` 分支：
+默认已经跟随官方安装脚本 `main` 分支。如果你想在命令里显式写出来，也可以：
 
 ```bash
 XRAY_INSTALL_REF=main /root/xray_deploy.sh
@@ -274,7 +274,7 @@ bash run_all_tests.sh
 
 **Q: 脚本提示 `Xray 安装脚本来源未配置`，是不是坏了？**
 
-A: 不是。脚本默认 `XRAY_INSTALL_REF_DEFAULT="PIN_ME"`，是为了避免直接执行远端 `main` 分支。生产环境建议固定 `XTLS/Xray-install` 的 commit 和 sha256；临时测试可用：
+A: 通常是你手动把脚本里的安装来源改成了空值。当前脚本默认 `XRAY_INSTALL_REF_DEFAULT="main"`，新 VPS 可直接安装。生产环境建议固定 `XTLS/Xray-install` 的 commit 和 sha256；也可以显式使用：
 
 ```bash
 XRAY_INSTALL_REF=main /root/xray_deploy.sh
