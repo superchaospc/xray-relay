@@ -1,4 +1,6 @@
-# 🚀 xray-relay
+# 🚀 xray-relay - Xray VLESS+REALITY 一键部署中转脚本
+
+> One-click Xray VLESS+REALITY deployment with residential SOCKS5 multi-hop relay support
 
 ![GitHub repo size](https://img.shields.io/github/repo-size/superchaospc/xray-relay?style=flat-square)
 ![GitHub last commit](https://img.shields.io/github/last-commit/superchaospc/xray-relay?style=flat-square)
