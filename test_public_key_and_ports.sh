@@ -43,7 +43,7 @@ PORT_SNIPPETS="$(awk '
 count="$(grep -c "if inb.get('tag') == 'api-in': continue" <<< "$PORT_SNIPPETS")"
 [ "$count" -ge 2 ]
 
-grep -Fq 'NEW_LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}' "$ROOT/xray_deploy.sh"
+grep -Fq 'NEW_LINK="vless://${UUID}@${LINK_HOST}:${NEW_PORT}' "$ROOT/xray_deploy.sh"
 grep -Fq 'type=tcp#${NODE_NAME}"' "$ROOT/xray_deploy.sh"
 
 echo "public key and port filtering ok"

@@ -3,6 +3,10 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.1 修复点：
+#    - 所有节点变更路径都会同步刷新订阅文件
+#    - 补充订阅文件生成测试，并在卸载时清理订阅文件
+#
 #  v2.2 改进点：
 #    - 新增批量添加住宅 SOCKS5 节点，一次最多导入 20 个
 #    - 批量节点自动以 IP/host 命名，成功后逐条输出链接和二维码
@@ -70,7 +74,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2       ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.1     ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -694,6 +698,15 @@ print(max_num + 1)
 PYEOF
 }
 
+format_vless_host() {
+    local host="$1"
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        printf '[%s]\n' "$host"
+    else
+        printf '%s\n' "$host"
+    fi
+}
+
 load_node_identity() {
     eval "$(
         CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
@@ -1033,6 +1046,8 @@ start_service() {
 
 print_result() {
     VPS_IP=$(get_ip)
+    local LINK_HOST
+    LINK_HOST=$(format_vless_host "$VPS_IP")
     echo ""
     echo -e "${CYAN}╔═══════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║              部署完成！                       ║${NC}"
@@ -1043,7 +1058,7 @@ print_result() {
 
     for i in "${!NODES[@]}"; do
         IFS=$'\x1f' read -r PORT S_HOST S_PORT S_USER S_PASS NAME <<< "${NODES[$i]}"
-        LINK="vless://${UUID}@${VPS_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NAME}"
+        LINK="vless://${UUID}@${LINK_HOST}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NAME}"
 
         echo -e "${GREEN}━━━ ${NAME} ━━━${NC}"
         echo -e "  监听端口: ${PORT}"
@@ -1077,6 +1092,8 @@ print_result() {
     echo -e "  Short ID:   ${SHORT_ID}"
     echo ""
     echo -e "${GREEN}所有链接已保存到 ${INFO_FILE} (权限 600)${NC}"
+    refresh_subscription_file_from_info || true
+    print_subscription_info
     if [ "$CLIENT_FP" = "chrome" ]; then
         echo -e "${CYAN}ℹ iOS / Shadowrocket 用户如需更贴近 iOS 指纹，可用 CLIENT_FP=ios 重新运行脚本${NC}"
     fi
@@ -1104,6 +1121,8 @@ PYEOF
     then
         : > "$INFO_FILE"
         chmod 600 "$INFO_FILE" 2>/dev/null || true
+        : > "$SUB_FILE"
+        chmod 600 "$SUB_FILE" 2>/dev/null || true
         return 0
     fi
 
@@ -1142,6 +1161,13 @@ public_key = os.environ["PUBLIC_KEY"]
 short_id = os.environ["SHORT_ID"]
 client_fp = os.environ["CLIENT_FP"]
 reality_server_name = os.environ["REALITY_SERVER_NAME"]
+
+def format_vless_host(host):
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        return f"[{host}]"
+    return host
+
+link_host = format_vless_host(vps_ip)
 
 old_names = {}
 if os.path.exists(info_file):
@@ -1203,7 +1229,7 @@ for inb in config.get("inbounds", []):
             dest_line = f"出口: {out_tag or 'unknown'}"
 
     link = (
-        f"vless://{uuid}@{vps_ip}:{port}"
+        f"vless://{uuid}@{link_host}:{port}"
         f"?encryption=none&flow=xtls-rprx-vision&security=reality"
         f"&sni={reality_server_name}&fp={client_fp}&pbk={public_key}"
         f"&sid={short_id}&type=tcp#{safe_name}"
@@ -1216,6 +1242,7 @@ with open(info_file, "w") as f:
         f.write("\n")
 PYEOF
     chmod 600 "$INFO_FILE" 2>/dev/null || true
+    refresh_subscription_file_from_info || true
 }
 
 sanitize_node_name() {
@@ -1226,46 +1253,51 @@ sanitize_node_name() {
     printf '%s\n' "$name"
 }
 
-print_subscription_link() {
-    if [ ! -s "$INFO_FILE" ]; then
-        return 0
-    fi
-
-    local data_uri
-    if ! data_uri=$(INFO_FILE="$INFO_FILE" SUB_FILE="$SUB_FILE" python3 << 'PYEOF'
+refresh_subscription_file_from_info() {
+    if ! INFO_FILE="$INFO_FILE" SUB_FILE="$SUB_FILE" python3 << 'PYEOF'
 import base64
 import os
 import re
-import sys
 
 info_file = os.environ["INFO_FILE"]
 sub_file = os.environ["SUB_FILE"]
 links = []
 
-with open(info_file, "r", encoding="utf-8", errors="ignore") as f:
-    for raw in f:
-        m = re.match(r"^链接:\s*(\S+)\s*$", raw.strip())
-        if m:
-            links.append(m.group(1))
+if os.path.exists(info_file):
+    with open(info_file, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            m = re.match(r"^链接:\s*(\S+)\s*$", raw.strip())
+            if m:
+                links.append(m.group(1))
 
-if not links:
-    sys.exit(1)
-
-content = "\n".join(links) + "\n"
+content = "\n".join(links)
+if links:
+    content += "\n"
 encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
 with open(sub_file, "w", encoding="utf-8") as f:
     f.write(encoded + "\n")
 os.chmod(sub_file, 0o600)
-print("data:text/plain;base64," + encoded)
 PYEOF
-    ); then
-        echo -e "${YELLOW}⚠ 订阅内容生成失败，节点链接仍已保存到 ${INFO_FILE}${NC}"
+    then
+        echo -e "${YELLOW}⚠ 订阅内容生成失败，节点链接仍已保存到 ${INFO_FILE}${NC}" >&2
+        return 1
+    fi
+}
+
+print_subscription_info() {
+    if [ ! -f "$SUB_FILE" ]; then
         return 0
     fi
 
     echo -e "${GREEN}订阅内容已保存到 ${SUB_FILE} (base64，权限 600)${NC}"
-    echo -e "${GREEN}订阅链接 (Data URL):${NC}"
-    echo -e "${YELLOW}${data_uri}${NC}"
+    if [ "${XRAY_PRINT_SUB_DATA_URL:-0}" = "1" ]; then
+        local data_uri
+        data_uri=$(tr -d '\n' < "$SUB_FILE")
+        echo -e "${GREEN}订阅链接 (Data URL):${NC}"
+        echo -e "${YELLOW}data:text/plain;base64,${data_uri}${NC}"
+    else
+        echo -e "${CYAN}如确需在终端打印 Data URL，可设置 XRAY_PRINT_SUB_DATA_URL=1 后重跑对应操作。${NC}"
+    fi
     echo -e "${CYAN}如需稳定远程订阅，可把 ${SUB_FILE} 的内容放到你自己的 HTTPS 静态地址。${NC}"
 }
 
@@ -1273,7 +1305,7 @@ PYEOF
 add_batch_nodes() {
     echo -e "${GREEN}[批量添加住宅 SOCKS5 节点]${NC}"
     echo -e "${CYAN}每行一个节点，最多 20 个；格式: host:port:user:pass${NC}"
-    echo -e "${CYAN}也支持 socks5://user:pass@host:port。粘贴完成后输入 done 或空行结束。${NC}"
+    echo -e "${CYAN}也支持 socks5://user:pass@host:port。粘贴完成后输入 done 结束。${NC}"
     echo -e "${CYAN}线路名称会自动使用 host/IP。${NC}"
     echo ""
 
@@ -1295,8 +1327,12 @@ add_batch_nodes() {
     local INPUT
     while [ "${#RAW_LINES[@]}" -lt 20 ]; do
         read -r INPUT || break
-        if [ "$INPUT" = "done" ] || [ "$INPUT" = "d" ] || [ -z "$INPUT" ]; then
+        if [ "$INPUT" = "done" ] || [ "$INPUT" = "d" ]; then
             break
+        fi
+        if [ -z "$INPUT" ]; then
+            echo -e "${YELLOW}空行已忽略；请输入 done 结束批量录入。${NC}"
+            continue
         fi
         RAW_LINES+=("$INPUT")
     done
@@ -1318,7 +1354,7 @@ add_batch_nodes() {
 
     local SEP=$'\x1f'
     local BATCH_NODES=()
-    local i line S_HOST S_PORT S_USER S_PASS NODE_NAME TAG_NUM LISTEN_PORT
+    local i line S_HOST S_PORT S_USER S_PASS NODE_NAME TAG_NUM LISTEN_PORT LINK_HOST LINK
     LISTEN_PORT="$NEXT_PORT"
     for i in "${!RAW_LINES[@]}"; do
         line="${RAW_LINES[$i]}"
@@ -1425,21 +1461,22 @@ PYEOF
         return
     fi
 
-    echo ""
-    echo -e "${GREEN}正在放行批量节点端口...${NC}"
-    for line in "${BATCH_NODES[@]}"; do
-        IFS=$'\x1f' read -r _ LISTEN_PORT _ _ _ _ _ <<< "$line"
-        apply_firewall_port_capture "$LISTEN_PORT"
-        echo -e "  ${LISTEN_PORT}: $(format_fw_status)"
-    done
-
     if restart_with_rollback; then
+        echo ""
+        echo -e "${GREEN}正在放行批量节点端口...${NC}"
+        for line in "${BATCH_NODES[@]}"; do
+            IFS=$'\x1f' read -r _ LISTEN_PORT _ _ _ _ _ <<< "$line"
+            apply_firewall_port_capture "$LISTEN_PORT"
+            echo -e "  ${LISTEN_PORT}: $(format_fw_status)"
+        done
+
         echo ""
         echo -e "${GREEN}✓ 批量节点添加成功！共 ${#BATCH_NODES[@]} 个${NC}"
         REFRESH_NAME_PORT="" REFRESH_NAME="" refresh_info_file_from_config || true
         for line in "${BATCH_NODES[@]}"; do
             IFS=$'\x1f' read -r _ LISTEN_PORT S_HOST S_PORT _ _ NODE_NAME <<< "$line"
-            LINK="vless://${UUID}@${VPS_IP}:${LISTEN_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
+            LINK_HOST=$(format_vless_host "$VPS_IP")
+            LINK="vless://${UUID}@${LINK_HOST}:${LISTEN_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
             echo ""
             echo -e "${GREEN}━━━ ${NODE_NAME} ━━━${NC}"
             echo -e "  监听端口: ${LISTEN_PORT}"
@@ -1447,7 +1484,7 @@ PYEOF
             echo -e "${YELLOW}  ${LINK}${NC}"
             show_qrcode "$LINK" "$NODE_NAME"
         done
-        print_subscription_link
+        print_subscription_info
     fi
 }
 
@@ -1571,10 +1608,11 @@ PYEOF
         return
     fi
 
-    apply_firewall_port_capture "$NEW_PORT"
-
     if restart_with_rollback; then
-        LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
+        apply_firewall_port_capture "$NEW_PORT"
+        local LINK_HOST
+        LINK_HOST=$(format_vless_host "$VPS_IP")
+        LINK="vless://${UUID}@${LINK_HOST}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
         echo ""
         echo -e "${GREEN}✓ 节点添加成功！${NC}"
         echo -e "${GREEN}端口: ${NEW_PORT}${NC}"
@@ -1583,6 +1621,7 @@ PYEOF
         echo -e "${YELLOW}${LINK}${NC}"
         REFRESH_NAME_PORT="$NEW_PORT" REFRESH_NAME="$NODE_NAME" refresh_info_file_from_config || true
         show_qrcode "$LINK" "$NODE_NAME"
+        print_subscription_info
     fi
 }
 
@@ -1675,10 +1714,11 @@ PYEOF
         echo -e "${RED}配置校验失败${NC}"; return
     fi
 
-    apply_firewall_port_capture "$NEW_PORT"
-
     if restart_with_rollback; then
-        LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
+        apply_firewall_port_capture "$NEW_PORT"
+        local LINK_HOST
+        LINK_HOST=$(format_vless_host "$VPS_IP")
+        LINK="vless://${UUID}@${LINK_HOST}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
         echo ""
         echo -e "${GREEN}✓ VPS 直连节点添加成功！${NC}"
         echo -e "${GREEN}端口: ${NEW_PORT}${NC}"
@@ -1687,6 +1727,7 @@ PYEOF
         echo -e "${YELLOW}${LINK}${NC}"
         REFRESH_NAME_PORT="$NEW_PORT" REFRESH_NAME="$NODE_NAME" refresh_info_file_from_config || true
         show_qrcode "$LINK" "$NODE_NAME"
+        print_subscription_info
     fi
 }
 
@@ -2107,8 +2148,8 @@ PYEOF
         echo -e "${RED}配置校验失败，已保留原配置${NC}"; return
     fi
 
-    apply_firewall_port_capture "$NEW_PORT"
     if restart_with_rollback; then
+        apply_firewall_port_capture "$NEW_PORT"
         echo -e "${GREEN}✓ 端口修改成功${NC}"
         echo -e "  $(format_fw_status)"
         VPS_IP=$(get_ip)
@@ -2131,10 +2172,13 @@ PYEOF
 )
         NODE_NAME=$(echo "$NODE_NAME" | tr ' \t#?&\r\n' '-' | tr -s '-' | sed 's/^-//; s/-$//')
         [ -z "$NODE_NAME" ] && NODE_NAME="Port-${NEW_PORT}"
-        NEW_LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
+        local LINK_HOST
+        LINK_HOST=$(format_vless_host "$VPS_IP")
+        NEW_LINK="vless://${UUID}@${LINK_HOST}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
         echo -e "${YELLOW}新链接:${NC} ${NEW_LINK}"
         refresh_info_file_from_config || true
         show_qrcode "$NEW_LINK" "$NODE_NAME"
+        print_subscription_info
     fi
 }
 
@@ -2229,6 +2273,7 @@ PYEOF
     if restart_with_rollback; then
         refresh_info_file_from_config || true
         echo -e "${GREEN}✓ 节点已删除${NC}"
+        print_subscription_info
     fi
 }
 
@@ -2393,7 +2438,7 @@ uninstall() {
         rm -rf /etc/systemd/system/xray.service.d
         systemctl daemon-reload 2>/dev/null || true
         (crontab -l 2>/dev/null || true) | grep -v "xray_traffic_record" | crontab - 2>/dev/null || true
-        rm -f "$CONFIG_FILE" "$INFO_FILE" "$SYSCTL_FILE" /root/.xray_traffic_db /root/.xray_traffic_record.sh \
+        rm -f "$CONFIG_FILE" "$INFO_FILE" "$SUB_FILE" "$SYSCTL_FILE" /root/.xray_traffic_db /root/.xray_traffic_record.sh \
               /root/.xray_monitor.conf /root/.xray_monitor.sh /root/.xray_vps_ip /root/.msmtprc \
               /tmp/.xray_node_failures /tmp/.xray_alert_lock_*
         # 配置备份保留，让用户决定是否清理

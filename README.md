@@ -33,12 +33,23 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.1 关键改动
+
+- 修复订阅文件只在批量添加时刷新导致的配置漂移；首次安装、单条添加、直连添加、改端口、删节点、查看状态都会同步刷新 `/root/xray_subscription.txt`
+- 卸载时同步清理 `/root/xray_subscription.txt`
+- 防火墙端口放行调整到 Xray 重启成功后执行，避免回滚时留下新端口规则
+- 批量粘贴时空行只会被忽略，不再提前结束录入；请用 `done` 结束
+- 默认不再打印超长 Data URL；如确需终端输出，可设置 `XRAY_PRINT_SUB_DATA_URL=1`
+- 新增订阅文件生成测试，测试套件覆盖到批量订阅相关代码
+
+---
+
 ## 🆕 v2.2.0 关键改动
 
 - 新增 **批量添加住宅 SOCKS5 节点** 菜单，一次最多导入 20 个 `host:port:user:pass` 节点
 - 批量导入时线路名称自动使用 IP/host，无需逐条输入备注
 - 批量添加成功后自动逐条输出 VLESS 链接和终端二维码
-- 自动生成 base64 订阅内容到 `/root/xray_subscription.txt`，并打印 Data URL 形式的订阅链接
+- 自动生成 base64 订阅内容到 `/root/xray_subscription.txt`
 - 首次部署与菜单添加共用同一套 SOCKS5 解析逻辑，减少格式校验分叉
 
 ---
@@ -186,7 +197,13 @@ curl -fsSL https://raw.githubusercontent.com/superchaospc/xray-relay/main/xray_d
 168.158.45.45:12324:14ae356118cc6:cb67514644
 ```
 
-粘贴完成后输入 `done` 或空行结束。脚本会自动用 IP/host 作为线路名称，批量写入配置，重启成功后逐条输出 VLESS 链接和二维码，并生成 base64 订阅内容到 `/root/xray_subscription.txt`，同时打印一个 Data URL 形式的订阅链接。
+粘贴完成后输入 `done` 结束。空行会被忽略，避免复制时多余换行提前终止录入。脚本会自动用 IP/host 作为线路名称，批量写入配置，重启成功后逐条输出 VLESS 链接和二维码，并生成 base64 订阅内容到 `/root/xray_subscription.txt`。
+
+如果你确实需要在终端直接打印 Data URL，可这样运行：
+
+```bash
+XRAY_PRINT_SUB_DATA_URL=1 bash xray_deploy.sh
+```
 
 ---
 
