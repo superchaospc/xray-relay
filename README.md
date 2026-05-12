@@ -20,7 +20,7 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🔐 **VLESS + REALITY + XTLS-Vision** 满血配置，默认伪装目标为 `www.cloudflare.com`，可用环境变量覆盖
 - 🌉 **中转架构**：VPS 入口 → 前置 SOCKS5（住宅 IP）出口，也支持纯 VPS 直连模式
 - 🎯 **固定端口映射**：每个前置节点绑定独立监听端口，客户端可精确选择出口，不做负载均衡
-- 🧩 **多节点管理**：菜单化添加、删除节点，修改端口
+- 🧩 **多节点管理**：菜单化添加、批量导入、删除节点，修改端口
 - 🛟 **安全写配置**：生成临时 JSON → `xray run -test` 校验 → 备份旧配置 → 原子替换 → 启动失败自动回滚
 - 🧱 **自动防火墙放行**：依次尝试 `ufw` / `firewalld` / `nftables` / `iptables`，nftables 会识别真实 input 链，尽量持久化规则，并对云厂商安全组给出提醒
 - 🔒 **供应链保护**：默认使用 Xray 官方安装脚本 `main` 分支，支持固定 commit 与 sha256 校验
@@ -30,6 +30,16 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🚨 **监控报警**：可选配置邮件告警（Gmail/QQ/163 等 SMTP），每分钟巡检，异常自动发信
 - 📱 **终端二维码**：节点生成后直接在终端渲染 VLESS 二维码，主流客户端扫码即导入
 - 🐧 **多发行版支持**：Debian / Ubuntu / CentOS / AlmaLinux / Rocky / Fedora
+
+---
+
+## 🆕 v2.2.0 关键改动
+
+- 新增 **批量添加住宅 SOCKS5 节点** 菜单，一次最多导入 20 个 `host:port:user:pass` 节点
+- 批量导入时线路名称自动使用 IP/host，无需逐条输入备注
+- 批量添加成功后自动逐条输出 VLESS 链接和终端二维码
+- 自动生成 base64 订阅内容到 `/root/xray_subscription.txt`，并打印 Data URL 形式的订阅链接
+- 首次部署与菜单添加共用同一套 SOCKS5 解析逻辑，减少格式校验分叉
 
 ---
 
@@ -166,6 +176,18 @@ curl -fsSL https://raw.githubusercontent.com/superchaospc/xray-relay/main/xray_d
 
 > 💡 扫码成功率与终端背景相关。白底或纯色主题最佳，避免透明/渐变背景。
 
+### 📦 批量添加住宅 SOCKS5
+
+菜单选择 **`13) 批量添加住宅 SOCKS5 节点`**，每行粘贴一个节点，最多 20 个：
+
+```text
+192.204.3.26:12324:14ae356118cc6:cb67514644
+192.204.0.126:12324:14ae356118cc6:cb67514644
+168.158.45.45:12324:14ae356118cc6:cb67514644
+```
+
+粘贴完成后输入 `done` 或空行结束。脚本会自动用 IP/host 作为线路名称，批量写入配置，重启成功后逐条输出 VLESS 链接和二维码，并生成 base64 订阅内容到 `/root/xray_subscription.txt`，同时打印一个 Data URL 形式的订阅链接。
+
 ---
 
 ## 🧭 菜单功能
@@ -184,6 +206,7 @@ curl -fsSL https://raw.githubusercontent.com/superchaospc/xray-relay/main/xray_d
 | 10 | 监控报警（邮件通知配置） |
 | 11 | 卸载 |
 | 12 | 添加 VPS 直连节点（不经住宅 IP） |
+| 13 | 批量添加住宅 SOCKS5 节点（最多 20 个） |
 | 0 | 退出 |
 
 ---

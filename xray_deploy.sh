@@ -3,6 +3,11 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2 改进点：
+#    - 新增批量添加住宅 SOCKS5 节点，一次最多导入 20 个
+#    - 批量节点自动以 IP/host 命名，成功后逐条输出链接和二维码
+#    - 自动生成 base64 订阅内容和 Data URL 订阅链接
+#
 #  v2.1 改进点（基于 code review）：
 #    - 配置写入采用 备份 → 临时文件 → xray -test → 原子替换 → 失败回滚 流程
 #    - 编号无效等校验失败时不再触发 firewall / 重启
@@ -28,6 +33,7 @@ CONFIG_FILE="/usr/local/etc/xray/config.json"
 CONFIG_DIR="$(dirname "$CONFIG_FILE")"
 CONFIG_BACKUP_KEEP=5
 INFO_FILE="/root/xray_nodes_info.txt"
+SUB_FILE="/root/xray_subscription.txt"
 SYSCTL_FILE="/etc/sysctl.d/99-xray.conf"
 IP_CACHE_FILE="/root/.xray_vps_ip"
 # VPS 公网 IP 缓存时间（秒）。EIP / 浮动 IP 切换后最多等 1 小时自动刷新。
@@ -64,7 +70,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.1       ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2       ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -228,19 +234,17 @@ run_xray_installer() {
 # 接受两种格式：
 #   1. host:port:user:pass            （常见格式，密码不能含 :）
 #   2. socks5://user:pass@host:port   （密码含特殊字符时使用，按 RFC 3986 URL 编码）
-# 解析成功后通过全局变量 PARSED_HOST / PARSED_PORT / PARSED_USER / PARSED_PASS 返回。
-# 失败时循环让用户重新输入，直到合法或 Ctrl+C。
-read_socks5() {
-    # 把 prompt 文案传进来；返回值通过全局变量
-    local prompt="$1"
-    local raw out
-    while true; do
-        read -rp "$prompt" raw
-        if [ -z "$raw" ]; then
-            echo -e "${RED}输入不能为空${NC}"
-            continue
-        fi
-        out=$(INPUT="$raw" python3 - <<'PYEOF' 2>&1
+# 解析成功后通过全局变量 PARSED_HOST / PARSED_PORT / PARSED_USER / PARSED_PASS 返回；
+# 解析失败时通过 PARSE_ERROR 返回错误文案。
+parse_socks5_raw() {
+    local raw="$1"
+    local out payload
+    PARSED_HOST="" PARSED_PORT="" PARSED_USER="" PARSED_PASS="" PARSE_ERROR=""
+    if [ -z "$raw" ]; then
+        PARSE_ERROR="输入不能为空"
+        return 1
+    fi
+    out=$(INPUT="$raw" python3 - <<'PYEOF' 2>&1
 import os, sys, re
 from urllib.parse import urlsplit, unquote
 
@@ -296,14 +300,26 @@ if len(parts) != 4:
 ok(parts[0], parts[1], parts[2], parts[3])
 PYEOF
 )
-        if [[ "$out" == OK* ]]; then
-            local payload="${out#OK	}"
-            IFS=$'\x1f' read -r PARSED_HOST PARSED_PORT PARSED_USER PARSED_PASS <<< "$payload"
+    if [[ "$out" == OK* ]]; then
+        payload="${out#OK	}"
+        IFS=$'\x1f' read -r PARSED_HOST PARSED_PORT PARSED_USER PARSED_PASS <<< "$payload"
+        return 0
+    fi
+    PARSE_ERROR="${out#ERR	}"
+    return 1
+}
+
+# 失败时循环让用户重新输入，直到合法或 Ctrl+C。
+read_socks5() {
+    local prompt="$1"
+    local raw
+    while true; do
+        read -rp "$prompt" raw
+        if parse_socks5_raw "$raw"; then
             return 0
-        else
-            echo -e "${RED}格式错误: ${out#ERR	}${NC}"
-            echo -e "${CYAN}请重新输入，或按 Ctrl+C 退出${NC}"
         fi
+        echo -e "${RED}格式错误: ${PARSE_ERROR}${NC}"
+        echo -e "${CYAN}请重新输入，或按 Ctrl+C 退出${NC}"
     done
 }
 
@@ -440,6 +456,22 @@ PYEOF
 port_in_use() {
     local port="$1"
     ss -tln 2>/dev/null | grep -q ":${port} "
+}
+
+config_port_in_use() {
+    local port="$1"
+    CONFIG_FILE="$CONFIG_FILE" CHECK_PORT="$port" python3 << 'PYEOF'
+import json, os, sys
+with open(os.environ["CONFIG_FILE"]) as f:
+    config = json.load(f)
+check = int(os.environ["CHECK_PORT"])
+used = {
+    inb.get("port")
+    for inb in config.get("inbounds", [])
+    if inb.get("tag") != "api-in"
+}
+sys.exit(0 if check in used else 1)
+PYEOF
 }
 
 # apply_firewall_port_capture: 调用 apply_firewall_port 并把返回码塞到全局变量 LAST_FW_RC。
@@ -803,53 +835,16 @@ collect_nodes() {
         fi
 
         # 严格解析 + 校验
-        if ! ( PARSED_HOST="" ; PARSED_PORT="" ; PARSED_USER="" ; PARSED_PASS="" ;
-               INPUT="$INPUT" python3 -c '
-import os, sys, re
-from urllib.parse import urlsplit, unquote
-raw = os.environ["INPUT"].strip()
-def fail(m): print("ERR\t"+m); sys.exit(0)
-def ok(h,p,u,w):
-    try: p=int(p)
-    except: fail("端口非数字")
-    if not(1<=p<=65535): fail("端口范围 1-65535")
-    if not h: fail("host 为空")
-    if not u: fail("用户名为空")
-    if not w: fail("密码为空")
-    for f in (h,str(p),u,w):
-        if re.search(r"[\x00-\x1f\x7f]", f):
-            fail("字段含控制字符（换行/Tab/回车等）")
-    print("OK\t"+"\x1f".join([h,str(p),u,w])); sys.exit(0)
-if raw.startswith(("socks5://","socks://")):
-    try:
-        u=urlsplit(raw); h=u.hostname; po=u.port; un=u.username; pw=u.password
-    except Exception as e:
-        fail(f"URL 解析失败: {e}")
-    if not h or not po: fail("URL 缺少 host/port")
-    ok(h,po,unquote(un or ""),unquote(pw or ""))
-m=re.match(r"^\[([0-9a-fA-F:]+)\]:(\d+):([^:]+):(.+)$", raw)
-if m: ok(m.group(1),m.group(2),m.group(3),m.group(4))
-parts=raw.split(":")
-if len(parts)!=4: fail(f"格式错误：常见格式需 3 个冒号 (实际 {len(parts)-1});密码含特殊字符请用 socks5:// URL")
-ok(*parts)
-' > /tmp/.xray_parse_$$ 2>&1 ); then
-            echo -e "${RED}解析失败${NC}"
-            rm -f "/tmp/.xray_parse_$$"
+        if ! parse_socks5_raw "$INPUT"; then
+            echo -e "${RED}格式错误: ${PARSE_ERROR}${NC}"
             NODE_NUM=$((NODE_NUM - 1))
             continue
         fi
-
-        local parsed
-        parsed=$(cat "/tmp/.xray_parse_$$")
-        rm -f "/tmp/.xray_parse_$$"
-        if [[ "$parsed" != OK* ]]; then
-            echo -e "${RED}格式错误: ${parsed#ERR	}${NC}"
-            NODE_NUM=$((NODE_NUM - 1))
-            continue
-        fi
-        local payload="${parsed#OK	}"
         local S_HOST S_PORT S_USER S_PASS
-        IFS=$'\x1f' read -r S_HOST S_PORT S_USER S_PASS <<< "$payload"
+        S_HOST="$PARSED_HOST"
+        S_PORT="$PARSED_PORT"
+        S_USER="$PARSED_USER"
+        S_PASS="$PARSED_PASS"
 
         local LISTEN_PORT
         if [ $NODE_NUM -eq 1 ]; then
@@ -1221,6 +1216,239 @@ with open(info_file, "w") as f:
         f.write("\n")
 PYEOF
     chmod 600 "$INFO_FILE" 2>/dev/null || true
+}
+
+sanitize_node_name() {
+    local name="$1"
+    local fallback="${2:-Node}"
+    name=$(printf '%s' "$name" | tr ' \t#?&\r\n' '-' | tr -s '-' | sed 's/^-//; s/-$//')
+    [ -z "$name" ] && name="$fallback"
+    printf '%s\n' "$name"
+}
+
+print_subscription_link() {
+    if [ ! -s "$INFO_FILE" ]; then
+        return 0
+    fi
+
+    local data_uri
+    if ! data_uri=$(INFO_FILE="$INFO_FILE" SUB_FILE="$SUB_FILE" python3 << 'PYEOF'
+import base64
+import os
+import re
+import sys
+
+info_file = os.environ["INFO_FILE"]
+sub_file = os.environ["SUB_FILE"]
+links = []
+
+with open(info_file, "r", encoding="utf-8", errors="ignore") as f:
+    for raw in f:
+        m = re.match(r"^链接:\s*(\S+)\s*$", raw.strip())
+        if m:
+            links.append(m.group(1))
+
+if not links:
+    sys.exit(1)
+
+content = "\n".join(links) + "\n"
+encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+with open(sub_file, "w", encoding="utf-8") as f:
+    f.write(encoded + "\n")
+os.chmod(sub_file, 0o600)
+print("data:text/plain;base64," + encoded)
+PYEOF
+    ); then
+        echo -e "${YELLOW}⚠ 订阅内容生成失败，节点链接仍已保存到 ${INFO_FILE}${NC}"
+        return 0
+    fi
+
+    echo -e "${GREEN}订阅内容已保存到 ${SUB_FILE} (base64，权限 600)${NC}"
+    echo -e "${GREEN}订阅链接 (Data URL):${NC}"
+    echo -e "${YELLOW}${data_uri}${NC}"
+    echo -e "${CYAN}如需稳定远程订阅，可把 ${SUB_FILE} 的内容放到你自己的 HTTPS 静态地址。${NC}"
+}
+
+# ========== 批量添加节点（住宅 SOCKS5）==========
+add_batch_nodes() {
+    echo -e "${GREEN}[批量添加住宅 SOCKS5 节点]${NC}"
+    echo -e "${CYAN}每行一个节点，最多 20 个；格式: host:port:user:pass${NC}"
+    echo -e "${CYAN}也支持 socks5://user:pass@host:port。粘贴完成后输入 done 或空行结束。${NC}"
+    echo -e "${CYAN}线路名称会自动使用 host/IP。${NC}"
+    echo ""
+
+    VPS_IP=$(get_ip)
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}未找到现有配置，请先完整安装！${NC}"
+        return
+    fi
+
+    load_node_identity
+    if [ -z "$PRIVATE_KEY" ] || [ -z "$SHORT_ID" ] || [ -z "$UUID" ]; then
+        echo -e "${RED}现有配置中的业务节点密钥信息不完整${NC}"
+        return
+    fi
+    PUBLIC_KEY=$(derive_public_key "$PRIVATE_KEY") || return
+
+    local RAW_LINES=()
+    local INPUT
+    while [ "${#RAW_LINES[@]}" -lt 20 ]; do
+        read -r INPUT || break
+        if [ "$INPUT" = "done" ] || [ "$INPUT" = "d" ] || [ -z "$INPUT" ]; then
+            break
+        fi
+        RAW_LINES+=("$INPUT")
+    done
+
+    if [ "${#RAW_LINES[@]}" -eq 20 ]; then
+        echo -e "${YELLOW}已达到单次批量上限 20 个节点。${NC}"
+    fi
+    if [ "${#RAW_LINES[@]}" -eq 0 ]; then
+        echo -e "${YELLOW}未输入任何节点，已取消。${NC}"
+        return
+    fi
+
+    local NEXT_PORT NEXT_TAG
+    if ! NEXT_PORT=$(get_next_inbound_port); then
+        echo -e "${RED}${NEXT_PORT:-ERROR: 无法计算下一个监听端口}${NC}"
+        return
+    fi
+    NEXT_TAG=$(get_next_tag_num)
+
+    local SEP=$'\x1f'
+    local BATCH_NODES=()
+    local i line S_HOST S_PORT S_USER S_PASS NODE_NAME TAG_NUM LISTEN_PORT
+    LISTEN_PORT="$NEXT_PORT"
+    for i in "${!RAW_LINES[@]}"; do
+        line="${RAW_LINES[$i]}"
+        if ! parse_socks5_raw "$line"; then
+            echo -e "${RED}第 $((i + 1)) 行格式错误: ${PARSE_ERROR}${NC}"
+            echo -e "${CYAN}未修改配置，请修正后重新批量导入。${NC}"
+            return
+        fi
+
+        S_HOST="$PARSED_HOST"
+        S_PORT="$PARSED_PORT"
+        S_USER="$PARSED_USER"
+        S_PASS="$PARSED_PASS"
+        NODE_NAME=$(sanitize_node_name "$S_HOST" "Node-$((i + 1))")
+        TAG_NUM=$((NEXT_TAG + i))
+
+        while port_in_use "$LISTEN_PORT" || config_port_in_use "$LISTEN_PORT"; do
+            LISTEN_PORT=$((LISTEN_PORT + 1))
+            if [ "$LISTEN_PORT" -gt 20000 ]; then
+                echo -e "${RED}未找到足够的可用监听端口${NC}"
+                return
+            fi
+        done
+
+        BATCH_NODES+=("${TAG_NUM}${SEP}${LISTEN_PORT}${SEP}${S_HOST}${SEP}${S_PORT}${SEP}${S_USER}${SEP}${S_PASS}${SEP}${NODE_NAME}")
+        echo -e "${GREEN}  ✓ 准备添加: ${NODE_NAME} → ${S_HOST}:${S_PORT} (监听 ${LISTEN_PORT})${NC}"
+        LISTEN_PORT=$((LISTEN_PORT + 1))
+    done
+
+    local NEW_CONFIG BATCH_DATA
+    if ! NEW_CONFIG=$(create_config_workfile copy); then
+        return
+    fi
+    BATCH_DATA=$(printf '%s\n' "${BATCH_NODES[@]}")
+
+    if ! NEW_CONFIG_FILE="$NEW_CONFIG" \
+        UUID="$UUID" PRIVATE_KEY="$PRIVATE_KEY" SHORT_ID="$SHORT_ID" \
+        REALITY_DEST="$REALITY_DEST" REALITY_SERVER_NAME="$REALITY_SERVER_NAME" \
+        BATCH_DATA="$BATCH_DATA" \
+        python3 << 'PYEOF'
+import json
+import os
+import sys
+
+new_config = os.environ["NEW_CONFIG_FILE"]
+uuid = os.environ["UUID"]
+private_key = os.environ["PRIVATE_KEY"]
+short_id = os.environ["SHORT_ID"]
+reality_dest = os.environ["REALITY_DEST"]
+reality_server_name = os.environ["REALITY_SERVER_NAME"]
+raw_nodes = [line for line in os.environ["BATCH_DATA"].splitlines() if line.strip()]
+
+with open(new_config) as f:
+    config = json.load(f)
+
+outbounds = config.setdefault("outbounds", [])
+if not any(ob.get("tag") == "direct" for ob in outbounds):
+    outbounds.append({"tag": "direct", "protocol": "freedom"})
+if not any(ob.get("tag") == "block" for ob in outbounds):
+    outbounds.append({"tag": "block", "protocol": "blackhole"})
+
+new_outbounds = []
+rules = config.setdefault("routing", {}).setdefault("rules", [])
+for node in raw_nodes:
+    tag_num, new_port, s_host, s_port, s_user, s_pass, node_name = node.split("\x1f", 6)
+    new_port = int(new_port)
+    try:
+        s_port = int(s_port)
+    except ValueError:
+        print("S_PORT 非数字")
+        sys.exit(2)
+
+    config.setdefault("inbounds", []).append({
+        "tag": f"vless-in-{tag_num}", "port": new_port, "protocol": "vless",
+        "_remark": node_name,
+        "settings": {"clients": [{"id": uuid, "flow": "xtls-rprx-vision"}], "decryption": "none"},
+        "streamSettings": {"network": "tcp", "security": "reality",
+            "realitySettings": {"dest": reality_dest, "serverNames": [reality_server_name],
+                "privateKey": private_key, "shortIds": [short_id]},
+            "sockopt": {"tcpFastOpen": True, "tcpNoDelay": True}},
+        "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
+    })
+    new_outbounds.append({
+        "tag": f"socks5-out-{tag_num}", "protocol": "socks",
+        "settings": {"servers": [{"address": s_host, "port": s_port, "users": [{"user": s_user, "pass": s_pass}]}]},
+        "streamSettings": {"sockopt": {"tcpFastOpen": True, "tcpNoDelay": True}}
+    })
+    rules.append({"type": "field", "inboundTag": [f"vless-in-{tag_num}"], "outboundTag": f"socks5-out-{tag_num}"})
+
+insert_at = next((idx for idx, ob in enumerate(outbounds) if ob.get("tag") == "direct"), len(outbounds))
+outbounds[insert_at:insert_at] = new_outbounds
+
+with open(new_config, "w") as f:
+    json.dump(config, f, indent=4)
+PYEOF
+    then
+        echo -e "${RED}配置生成失败${NC}"
+        rm -f "$NEW_CONFIG"
+        return
+    fi
+
+    if ! validate_and_install_config "$NEW_CONFIG"; then
+        echo -e "${RED}新配置校验失败，已保留原配置${NC}"
+        return
+    fi
+
+    echo ""
+    echo -e "${GREEN}正在放行批量节点端口...${NC}"
+    for line in "${BATCH_NODES[@]}"; do
+        IFS=$'\x1f' read -r _ LISTEN_PORT _ _ _ _ _ <<< "$line"
+        apply_firewall_port_capture "$LISTEN_PORT"
+        echo -e "  ${LISTEN_PORT}: $(format_fw_status)"
+    done
+
+    if restart_with_rollback; then
+        echo ""
+        echo -e "${GREEN}✓ 批量节点添加成功！共 ${#BATCH_NODES[@]} 个${NC}"
+        REFRESH_NAME_PORT="" REFRESH_NAME="" refresh_info_file_from_config || true
+        for line in "${BATCH_NODES[@]}"; do
+            IFS=$'\x1f' read -r _ LISTEN_PORT S_HOST S_PORT _ _ NODE_NAME <<< "$line"
+            LINK="vless://${UUID}@${VPS_IP}:${LISTEN_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
+            echo ""
+            echo -e "${GREEN}━━━ ${NODE_NAME} ━━━${NC}"
+            echo -e "  监听端口: ${LISTEN_PORT}"
+            echo -e "  落地节点: ${S_HOST}:${S_PORT}"
+            echo -e "${YELLOW}  ${LINK}${NC}"
+            show_qrcode "$LINK" "$NODE_NAME"
+        done
+        print_subscription_link
+    fi
 }
 
 # ========== 添加节点（住宅 SOCKS5）==========
@@ -2551,9 +2779,10 @@ main_menu() {
     echo "  10) 监控报警"
     echo "  11) 卸载"
     echo "  12) 添加 VPS 直连节点"
+    echo "  13) 批量添加住宅 SOCKS5 节点"
     echo "  0) 退出"
     echo ""
-    read -rp "请选择 [0-12]: " CHOICE
+    read -rp "请选择 [0-13]: " CHOICE
 
     case $CHOICE in
         1)
@@ -2578,6 +2807,7 @@ main_menu() {
         10) monitor_menu;;
         11) uninstall;;
         12) add_direct_node;;
+        13) add_batch_nodes;;
         0)  exit 0;;
         *)  echo -e "${RED}无效选项${NC}";;
     esac
