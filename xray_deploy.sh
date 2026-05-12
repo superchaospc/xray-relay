@@ -495,6 +495,32 @@ persist_nftables_rules() {
     return 0
 }
 
+nft_input_chains() {
+    nft list ruleset 2>/dev/null | awk '
+        /^table[ \t]+/ {
+            family=$2
+            table=$3
+            gsub(/[ \t]*\{.*$/, "", table)
+        }
+        /^[ \t]*chain[ \t]+/ {
+            chain=$2
+            gsub(/[ \t]*\{.*$/, "", chain)
+        }
+        /hook[ \t]+input/ {
+            policy="accept"
+            for (i = 1; i <= NF; i++) {
+                if ($i == "policy" && i < NF) {
+                    policy=$(i + 1)
+                    gsub(/[;}]/, "", policy)
+                }
+            }
+            if (family != "" && table != "" && chain != "") {
+                print family "\t" table "\t" chain "\t" policy
+            }
+        }
+    '
+}
+
 # apply_firewall_port: 在主流防火墙后端中放行指定 TCP 端口
 # 返回值：
 #   0 = 成功放行（或规则已存在）
@@ -532,40 +558,47 @@ apply_firewall_port() {
         return 3
     fi
 
-    # nftables：尝试自动放行
-    # 策略：如果存在 inet filter input chain 就往里加；否则尝试常见的 ip filter INPUT；都不行就警告
+    # nftables：遍历实际存在的 input base chain。不同发行版/工具会创建不同表名，
+    # 例如 fail2ban 常见 f2b-table/f2b-chain，不能假设一定有 inet filter input。
     if command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q "^table"; then
-        local nft_added=0
+        local nft_seen_input=0 nft_changed=0 nft_failed=0
+        local family table chain policy chain_rules
 
-        # 尝试 inet filter input（systemd / 现代发行版默认）
-        if nft list chain inet filter input &>/dev/null; then
-            # 去重检查：rule 已经存在就跳过
-            if ! nft list chain inet filter input 2>/dev/null | grep -qE "tcp dport .*\b${port}\b.* accept"; then
-                if nft add rule inet filter input tcp dport "$port" accept 2>/dev/null; then
-                    nft_added=1
+        while IFS=$'\t' read -r family table chain policy; do
+            [ -n "${family:-}" ] && [ -n "${table:-}" ] && [ -n "${chain:-}" ] || continue
+            nft_seen_input=1
+            policy="${policy:-accept}"
+
+            chain_rules=$(nft list chain "$family" "$table" "$chain" 2>/dev/null || true)
+            if echo "$chain_rules" | grep -qE "tcp dport .*\b${port}\b.* accept"; then
+                echo -e "  ${GREEN}✓ nftables 已存在 ${port}/tcp 放行规则: ${family} ${table} ${chain}${NC}"
+                continue
+            fi
+
+            if [ "$policy" = "drop" ] || [ "$policy" = "reject" ]; then
+                if nft insert rule "$family" "$table" "$chain" tcp dport "$port" accept 2>/dev/null; then
+                    nft_changed=1
+                    echo -e "  ${GREEN}✓ 已通过 nftables 放行 ${port}/tcp: ${family} ${table} ${chain}${NC}"
+                else
+                    nft_failed=1
+                    echo -e "  ${RED}✗ nftables 放行 ${port}/tcp 失败: ${family} ${table} ${chain}${NC}"
                 fi
             else
-                nft_added=1   # 规则已存在视为成功
+                echo -e "  ${GREEN}✓ nftables input 链默认 ${policy}，无需额外放行: ${family} ${table} ${chain}${NC}"
             fi
+        done < <(nft_input_chains)
+
+        if [ "$nft_failed" -eq 0 ] && [ "$nft_seen_input" -eq 0 ]; then
+            echo -e "  ${GREEN}✓ nftables 未发现 input 过滤链，系统默认不拦截入站${NC}"
         fi
 
-        # 兜底：尝试 ip filter INPUT
-        if [ "$nft_added" -eq 0 ] && nft list chain ip filter INPUT &>/dev/null; then
-            if ! nft list chain ip filter INPUT 2>/dev/null | grep -qE "tcp dport .*\b${port}\b.* accept"; then
-                if nft add rule ip filter INPUT tcp dport "$port" accept 2>/dev/null; then
-                    nft_added=1
+        if [ "$nft_failed" -eq 0 ]; then
+            if [ "$nft_changed" -eq 1 ]; then
+                if persist_nftables_rules; then
+                    echo -e "  ${GREEN}✓ nftables 规则已持久化到 /etc/nftables.conf${NC}"
+                else
+                    echo -e "  ${YELLOW}⚠ nftables 当前已放行，但自动持久化失败，重启后可能失效${NC}"
                 fi
-            else
-                nft_added=1
-            fi
-        fi
-
-        if [ "$nft_added" -eq 1 ]; then
-            echo -e "  ${GREEN}✓ 已通过 nftables 放行 ${port}/tcp${NC}"
-            if persist_nftables_rules; then
-                echo -e "  ${GREEN}✓ nftables 规则已持久化到 /etc/nftables.conf${NC}"
-            else
-                echo -e "  ${YELLOW}⚠ nftables 当前已放行，但自动持久化失败，重启后可能失效${NC}"
             fi
             echo -e "  ${CYAN}ℹ 提醒：云厂商安全组仍需手动放行 ${port}/tcp${NC}"
             return 0
@@ -573,8 +606,7 @@ apply_firewall_port() {
 
         # 自动放行失败：返回硬错误
         echo -e "  ${RED}✗ 检测到 nftables，但未能自动放行端口 ${port}${NC}"
-        echo -e "  ${YELLOW}  外部连接很可能被默认 drop 策略丢弃，请手动执行：${NC}"
-        echo -e "  ${YELLOW}    nft add rule inet filter input tcp dport ${port} accept${NC}"
+        echo -e "  ${YELLOW}  外部连接可能被默认 drop 策略丢弃，请按上方表/链名手动 insert 规则${NC}"
         echo -e "  ${YELLOW}    （或写入你的 /etc/nftables.conf 后 nft -f 重新加载）${NC}"
         echo -e "  ${CYAN}ℹ 提醒：云厂商安全组仍需手动放行 ${port}/tcp${NC}"
         return 3
