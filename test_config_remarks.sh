@@ -9,6 +9,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 CONFIG_FILE="$TMP_DIR/config.json"
 INFO_FILE="$TMP_DIR/xray_nodes_info.txt"
 REFRESH_PY="$TMP_DIR/refresh_info.py"
+FORMAT_HELPER="$TMP_DIR/format_vless_host.py"
 
 awk '
     /refresh_info_file_from_config\(\) \{/ {fn=1; next}
@@ -16,6 +17,13 @@ awk '
     inside && /^PYEOF$/ {exit}
     inside {print}
 ' "$ROOT/xray_deploy.sh" > "$REFRESH_PY"
+
+awk '
+    /format_vless_host_py\(\) \{/ {fn=1; next}
+    fn && /cat <<'\''PYEOF'\''/ {inside=1; next}
+    inside && /^PYEOF$/ {exit}
+    inside {print}
+' "$ROOT/xray_deploy.sh" > "$FORMAT_HELPER"
 
 cat > "$CONFIG_FILE" <<'JSON'
 {
@@ -60,6 +68,7 @@ PUBLIC_KEY="PUBKEY" \
 SHORT_ID="SID" \
 CLIENT_FP="chrome" \
 REALITY_SERVER_NAME="www.cloudflare.com" \
+FORMAT_VLESS_HOST_PY="$(cat "$FORMAT_HELPER")" \
 python3 "$REFRESH_PY"
 
 grep -Fq "=== LA-Direct ===" "$INFO_FILE"

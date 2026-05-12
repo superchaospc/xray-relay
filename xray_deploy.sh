@@ -7,6 +7,11 @@
 #    - 所有节点变更路径都会同步刷新订阅文件
 #    - 补充订阅文件生成测试，并在卸载时清理订阅文件
 #
+#  v2.2.2 修复点：
+#    - 修改端口 / 删除节点后尽量回收旧防火墙端口规则
+#    - 订阅文件改为临时文件 + 原子替换写入
+#    - 测试可用 XRAY_BIN 指向 fake xray，避免本机未安装 xray 时误报
+#
 #  v2.2 改进点：
 #    - 新增批量添加住宅 SOCKS5 节点，一次最多导入 20 个
 #    - 批量节点自动以 IP/host 命名，成功后逐条输出链接和二维码
@@ -74,7 +79,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.1     ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.2     ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -487,6 +492,12 @@ apply_firewall_port_capture() {
     return 0
 }
 
+revoke_firewall_port_capture() {
+    LAST_FW_REVOKE_RC=0
+    revoke_firewall_port "$1" || LAST_FW_REVOKE_RC=$?
+    return 0
+}
+
 # format_fw_status: 根据 LAST_FW_RC 输出一行可附加在"节点添加成功"等消息后的状态提示
 # 不输出任何内容时返回 0；调用方可以直接 echo "$(format_fw_status)"
 format_fw_status() {
@@ -495,6 +506,15 @@ format_fw_status() {
         2)  echo -e "${YELLOW}防火墙: 未检测到后端，请确认默认策略允许该端口${NC}" ;;
         3)  echo -e "${RED}⚠ 防火墙放行失败！外部连接可能不通，请按上方提示手动处理${NC}" ;;
         *)  echo -e "${YELLOW}防火墙: 未知状态 (rc=${LAST_FW_RC})${NC}" ;;
+    esac
+}
+
+format_fw_revoke_status() {
+    case "${LAST_FW_REVOKE_RC:-0}" in
+        0)  echo -e "${GREEN}旧端口防火墙: 已尝试回收 ✓${NC}" ;;
+        2)  echo -e "${YELLOW}旧端口防火墙: 未检测到后端，跳过回收${NC}" ;;
+        3)  echo -e "${YELLOW}旧端口防火墙: 自动回收失败，请按需手动清理${NC}" ;;
+        *)  echo -e "${YELLOW}旧端口防火墙: 未知状态 (rc=${LAST_FW_REVOKE_RC})${NC}" ;;
     esac
 }
 
@@ -684,6 +704,93 @@ apply_firewall_port() {
     return 2
 }
 
+# revoke_firewall_port: best-effort 回收脚本曾经自动放行的 TCP 端口。
+# 云厂商安全组无法自动回收，且防火墙规则可能并非本脚本创建，因此失败只提示不阻断主流程。
+revoke_firewall_port() {
+    local port="$1"
+
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw --force delete allow "${port}/tcp" >/dev/null 2>&1 || \
+            ufw --force delete allow "$port" >/dev/null 2>&1 || true
+        echo -e "  ${CYAN}ℹ 已尝试从 ufw 回收 ${port}/tcp；云厂商安全组仍需手动清理${NC}"
+        return 0
+    fi
+
+    if command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null; then
+        local fw_rm_rc=0 fw_reload_rc=0
+        firewall-cmd --zone=public --remove-port="${port}/tcp" --permanent >/dev/null 2>&1 || fw_rm_rc=$?
+        firewall-cmd --reload >/dev/null 2>&1 || fw_reload_rc=$?
+        if [ "$fw_rm_rc" -eq 0 ] && [ "$fw_reload_rc" -eq 0 ]; then
+            echo -e "  ${CYAN}ℹ 已从 firewalld 回收 ${port}/tcp；云厂商安全组仍需手动清理${NC}"
+            return 0
+        fi
+        echo -e "  ${YELLOW}⚠ firewalld 回收 ${port}/tcp 失败 (remove rc=${fw_rm_rc}, reload rc=${fw_reload_rc})${NC}"
+        return 3
+    fi
+
+    if command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q "^table"; then
+        local nft_seen_input=0 nft_changed=0 nft_failed=0
+        local family table chain policy line handle
+        while IFS=$'\t' read -r family table chain policy; do
+            [ -n "${family:-}" ] && [ -n "${table:-}" ] && [ -n "${chain:-}" ] || continue
+            nft_seen_input=1
+            while IFS= read -r line; do
+                handle=$(printf '%s\n' "$line" | sed -n 's/.* # handle \([0-9][0-9]*\)$/\1/p')
+                [ -n "$handle" ] || continue
+                if nft delete rule "$family" "$table" "$chain" handle "$handle" 2>/dev/null; then
+                    nft_changed=1
+                else
+                    nft_failed=1
+                fi
+            done < <(
+                nft -a list chain "$family" "$table" "$chain" 2>/dev/null \
+                    | grep -E "tcp dport .*\b${port}\b.* accept.* # handle " || true
+            )
+        done < <(nft_input_chains)
+
+        if [ "$nft_failed" -ne 0 ]; then
+            echo -e "  ${YELLOW}⚠ nftables 回收 ${port}/tcp 失败，请按需手动清理${NC}"
+            return 3
+        fi
+        if [ "$nft_changed" -eq 1 ]; then
+            if persist_nftables_rules; then
+                echo -e "  ${CYAN}ℹ 已从 nftables 回收 ${port}/tcp 并持久化；云厂商安全组仍需手动清理${NC}"
+            else
+                echo -e "  ${YELLOW}⚠ nftables 当前已回收 ${port}/tcp，但自动持久化失败${NC}"
+            fi
+        elif [ "$nft_seen_input" -eq 1 ]; then
+            echo -e "  ${CYAN}ℹ nftables 未找到 ${port}/tcp 放行规则，无需回收${NC}"
+        else
+            echo -e "  ${CYAN}ℹ nftables 未发现 input 过滤链，跳过回收${NC}"
+        fi
+        return 0
+    fi
+
+    if command -v iptables &>/dev/null; then
+        local ipt_changed=0
+        while iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do
+            iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || break
+            ipt_changed=1
+        done
+        if [ "$ipt_changed" -eq 1 ]; then
+            if command -v netfilter-persistent &>/dev/null; then
+                netfilter-persistent save >/dev/null 2>&1 || true
+            elif [ -d /etc/iptables ]; then
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            elif command -v service &>/dev/null; then
+                service iptables save >/dev/null 2>&1 || true
+            fi
+            echo -e "  ${CYAN}ℹ 已从 iptables 回收 ${port}/tcp；云厂商安全组仍需手动清理${NC}"
+        else
+            echo -e "  ${CYAN}ℹ iptables 未找到 ${port}/tcp 放行规则，无需回收${NC}"
+        fi
+        return 0
+    fi
+
+    echo -e "  ${YELLOW}⚠ 未检测到 ufw / firewalld / nftables / iptables，跳过旧端口回收${NC}"
+    return 2
+}
+
 get_next_tag_num() {
     CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
 import json, os, re
@@ -698,13 +805,21 @@ print(max_num + 1)
 PYEOF
 }
 
+format_vless_host_py() {
+    cat <<'PYEOF'
+def format_vless_host(host):
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        return f"[{host}]"
+    return host
+PYEOF
+}
+
 format_vless_host() {
-    local host="$1"
-    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
-        printf '[%s]\n' "$host"
-    else
-        printf '%s\n' "$host"
-    fi
+    HOST="$1" FORMAT_VLESS_HOST_PY="$(format_vless_host_py)" python3 <<'PYEOF'
+import os
+exec(os.environ["FORMAT_VLESS_HOST_PY"])
+print(format_vless_host(os.environ["HOST"]))
+PYEOF
 }
 
 load_node_identity() {
@@ -796,8 +911,9 @@ generate_keys() {
 
 derive_public_key() {
     local private_key="$1"
+    local xray_bin="${XRAY_BIN:-xray}"
     local public_key
-    public_key=$(xray x25519 -i "$private_key" 2>/dev/null | grep -i "public" | awk '{print $NF}' || true)
+    public_key=$("$xray_bin" x25519 -i "$private_key" 2>/dev/null | grep -i "public" | awk '{print $NF}' || true)
     if [ -z "$public_key" ]; then
         echo -e "${RED}✗ 无法派生 public key，请检查 xray 二进制或 private key${NC}" >&2
         return 1
@@ -1121,8 +1237,7 @@ PYEOF
     then
         : > "$INFO_FILE"
         chmod 600 "$INFO_FILE" 2>/dev/null || true
-        : > "$SUB_FILE"
-        chmod 600 "$SUB_FILE" 2>/dev/null || true
+        refresh_subscription_file_from_info || true
         return 0
     fi
 
@@ -1146,6 +1261,7 @@ PYEOF
     SHORT_ID="$SHORT_ID" \
     CLIENT_FP="$CLIENT_FP" \
     REALITY_SERVER_NAME="$REALITY_SERVER_NAME" \
+    FORMAT_VLESS_HOST_PY="$(format_vless_host_py)" \
     REFRESH_NAME_PORT="${REFRESH_NAME_PORT:-}" \
     REFRESH_NAME="${REFRESH_NAME:-}" \
     python3 << 'PYEOF'
@@ -1162,11 +1278,7 @@ short_id = os.environ["SHORT_ID"]
 client_fp = os.environ["CLIENT_FP"]
 reality_server_name = os.environ["REALITY_SERVER_NAME"]
 
-def format_vless_host(host):
-    if ":" in host and not (host.startswith("[") and host.endswith("]")):
-        return f"[{host}]"
-    return host
-
+exec(os.environ["FORMAT_VLESS_HOST_PY"])
 link_host = format_vless_host(vps_ip)
 
 old_names = {}
@@ -1258,6 +1370,7 @@ refresh_subscription_file_from_info() {
 import base64
 import os
 import re
+import tempfile
 
 info_file = os.environ["INFO_FILE"]
 sub_file = os.environ["SUB_FILE"]
@@ -1274,9 +1387,16 @@ content = "\n".join(links)
 if links:
     content += "\n"
 encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-with open(sub_file, "w", encoding="utf-8") as f:
-    f.write(encoded + "\n")
-os.chmod(sub_file, 0o600)
+sub_dir = os.path.dirname(sub_file) or "."
+fd, tmp_file = tempfile.mkstemp(prefix=".xray-subscription.", dir=sub_dir, text=True)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(encoded + "\n")
+    os.chmod(tmp_file, 0o600)
+    os.replace(tmp_file, sub_file)
+finally:
+    if os.path.exists(tmp_file):
+        os.unlink(tmp_file)
 PYEOF
     then
         echo -e "${YELLOW}⚠ 订阅内容生成失败，节点链接仍已保存到 ${INFO_FILE}${NC}" >&2
@@ -1293,6 +1413,10 @@ print_subscription_info() {
     if [ "${XRAY_PRINT_SUB_DATA_URL:-0}" = "1" ]; then
         local data_uri
         data_uri=$(tr -d '\n' < "$SUB_FILE")
+        if [ -z "$data_uri" ]; then
+            echo -e "${YELLOW}暂无订阅节点，跳过 Data URL 输出${NC}"
+            return 0
+        fi
         echo -e "${GREEN}订阅链接 (Data URL):${NC}"
         echo -e "${YELLOW}data:text/plain;base64,${data_uri}${NC}"
     else
@@ -2096,7 +2220,7 @@ for inb in config["inbounds"]:
 PYEOF
 
     echo ""
-    local IDX NEW_PORT
+    local IDX NEW_PORT OLD_PORT
     read -rp "选择要修改的节点编号: " IDX
     read -rp "新端口号: " NEW_PORT
     if [ -z "$IDX" ] || [ -z "$NEW_PORT" ]; then
@@ -2107,6 +2231,27 @@ PYEOF
     fi
     if port_in_use "$NEW_PORT"; then
         echo -e "${RED}端口 ${NEW_PORT} 已被占用${NC}"; return
+    fi
+    if ! OLD_PORT=$(CONFIG_FILE="$CONFIG_FILE" IDX="$IDX" python3 << 'PYEOF'
+import json
+import os
+import sys
+
+try:
+    idx = int(os.environ["IDX"]) - 1
+except ValueError:
+    sys.exit(2)
+
+with open(os.environ["CONFIG_FILE"]) as f:
+    config = json.load(f)
+business = [inb for inb in config.get("inbounds", []) if inb.get("tag") != "api-in"]
+if not (0 <= idx < len(business)):
+    sys.exit(2)
+print(business[idx].get("port", ""))
+PYEOF
+    ); then
+        echo -e "${RED}编号无效${NC}"
+        return
     fi
 
     local NEW_CONFIG
@@ -2152,6 +2297,10 @@ PYEOF
         apply_firewall_port_capture "$NEW_PORT"
         echo -e "${GREEN}✓ 端口修改成功${NC}"
         echo -e "  $(format_fw_status)"
+        if [ -n "$OLD_PORT" ] && [ "$OLD_PORT" != "$NEW_PORT" ]; then
+            revoke_firewall_port_capture "$OLD_PORT"
+            echo -e "  $(format_fw_revoke_status)"
+        fi
         VPS_IP=$(get_ip)
         load_node_identity
         PUBLIC_KEY=$(derive_public_key "$PRIVATE_KEY") || return
@@ -2214,10 +2363,31 @@ for inb in config["inbounds"]:
 PYEOF
 
     echo ""
-    local IDX
+    local IDX DELETE_PORT
     read -rp "选择要删除的节点编号: " IDX
     if [ -z "$IDX" ]; then
         echo -e "${RED}输入不能为空${NC}"; return
+    fi
+    if ! DELETE_PORT=$(CONFIG_FILE="$CONFIG_FILE" IDX="$IDX" python3 << 'PYEOF'
+import json
+import os
+import sys
+
+try:
+    idx = int(os.environ["IDX"]) - 1
+except ValueError:
+    sys.exit(2)
+
+with open(os.environ["CONFIG_FILE"]) as f:
+    config = json.load(f)
+business = [inb for inb in config.get("inbounds", []) if inb.get("tag") != "api-in"]
+if not (0 <= idx < len(business)):
+    sys.exit(2)
+print(business[idx].get("port", ""))
+PYEOF
+    ); then
+        echo -e "${RED}编号无效${NC}"
+        return
     fi
 
     local NEW_CONFIG
@@ -2271,6 +2441,10 @@ PYEOF
     fi
 
     if restart_with_rollback; then
+        if [ -n "$DELETE_PORT" ]; then
+            revoke_firewall_port_capture "$DELETE_PORT"
+            echo -e "  $(format_fw_revoke_status)"
+        fi
         refresh_info_file_from_config || true
         echo -e "${GREEN}✓ 节点已删除${NC}"
         print_subscription_info

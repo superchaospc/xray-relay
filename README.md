@@ -33,6 +33,17 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.2 关键改动
+
+- 修改节点端口后会尽量回收旧端口的 `ufw` / `firewalld` / `nftables` / `iptables` 放行规则
+- 删除节点后会尽量回收被删除节点的防火墙端口规则，减少长期运行后的失效规则堆积
+- 订阅文件改为临时文件 + 原子替换写入，避免静态 Web 服务读到截断内容
+- `format_vless_host` 的 IPv6 包裹逻辑统一由同一段 Python helper 提供，避免 Bash / Python 双份实现漂移
+- 空订阅不再打印空 Data URL
+- `test_public_key_and_ports.sh` 使用 `XRAY_BIN` 指向 fake xray，macOS 未安装真实 xray 时也能稳定测试
+
+---
+
 ## 🆕 v2.2.1 关键改动
 
 - 修复订阅文件只在批量添加时刷新导致的配置漂移；首次安装、单条添加、直连添加、改端口、删节点、查看状态都会同步刷新 `/root/xray_subscription.txt`

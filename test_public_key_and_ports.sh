@@ -30,9 +30,9 @@ esac
 SH
 chmod +x "$TMP_DIR/xray"
 
-PATH="$TMP_DIR:$PATH" RED="" NC="" XRAY_FAKE_MODE=ok bash -c "source '$HELPER'; got=\$(derive_public_key PRIV); [ \"\$got\" = PUBKEY ]"
-PATH="$TMP_DIR:$PATH" RED="" NC="" XRAY_FAKE_MODE=fail bash -c "source '$HELPER'; ! derive_public_key PRIV >/dev/null"
-PATH="$TMP_DIR:$PATH" RED="" NC="" XRAY_FAKE_MODE=empty bash -c "source '$HELPER'; ! derive_public_key PRIV >/dev/null"
+RED="" NC="" XRAY_BIN="$TMP_DIR/xray" XRAY_FAKE_MODE=ok bash -c "source '$HELPER'; got=\$(derive_public_key PRIV); [ \"\$got\" = PUBKEY ]"
+RED="" NC="" XRAY_BIN="$TMP_DIR/xray" XRAY_FAKE_MODE=fail bash -c "source '$HELPER'; ! derive_public_key PRIV >/dev/null"
+RED="" NC="" XRAY_BIN="$TMP_DIR/xray" XRAY_FAKE_MODE=empty bash -c "source '$HELPER'; ! derive_public_key PRIV >/dev/null"
 
 PORT_SNIPPETS="$(awk '
     /PORTS=.*python3 -c "/ {inside=1}
