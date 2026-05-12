@@ -39,6 +39,7 @@ fi
 echo ""
 echo "=== 单元测试 ==="
 run "test_parser.py (SOCKS5 输入解析)" python3 test_parser.py
+run "test_prompt_read_eof.sh (交互 EOF 优雅退出)" bash test_prompt_read_eof.sh
 run "test_next_port.sh (入站端口计算)" bash test_next_port.sh
 run "test_public_key_and_ports.sh (public key 与业务端口)" bash test_public_key_and_ports.sh
 run "test_atomic_config.sh (配置原子写入)" bash test_atomic_config.sh

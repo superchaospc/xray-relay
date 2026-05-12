@@ -17,6 +17,9 @@
 #    - 修改端口时允许新旧端口相同的 no-op 输入
 #    - firewalld 旧端口不存在时提示无需回收，而不是报失败
 #
+#  v2.2.4 修复点：
+#    - 交互提示在 stdin EOF 时优雅退出，避免非交互管道触发 set -e 退出 1
+#
 #  v2.2 改进点：
 #    - 新增批量添加住宅 SOCKS5 节点，一次最多导入 20 个
 #    - 批量节点自动以 IP/host 命名，成功后逐条输出链接和二维码
@@ -84,7 +87,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.3     ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.4     ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -98,6 +101,16 @@ redact() {
         return
     fi
     echo "${s:0:4}…${s: -4}"
+}
+
+prompt_read() {
+    local __var="$1"
+    shift
+    if ! read "$@" "$__var"; then
+        echo "" >&2
+        echo -e "${YELLOW}输入流已结束，操作取消。${NC}" >&2
+        exit 0
+    fi
 }
 
 get_ip() {
@@ -119,7 +132,7 @@ get_ip() {
          curl -s4 --max-time 5 icanhazip.com 2>/dev/null || true)
     if [ -z "$IP" ]; then
         echo -e "${RED}无法获取本机公网 IP，请手动输入:${NC}" >&2
-        read -rp "VPS 公网 IP: " IP
+        prompt_read IP -rp "VPS 公网 IP: "
     fi
 
     echo "$IP" > "$IP_CACHE_FILE" 2>/dev/null || true
@@ -328,7 +341,7 @@ read_socks5() {
     local prompt="$1"
     local raw
     while true; do
-        read -rp "$prompt" raw
+        prompt_read raw -rp "$prompt"
         if parse_socks5_raw "$raw"; then
             return 0
         fi
@@ -946,7 +959,7 @@ collect_nodes() {
     while true; do
         NODE_NUM=$((NODE_NUM + 1))
         local INPUT
-        read -rp "节点${NODE_NUM} (输入 done 结束): " INPUT
+        prompt_read INPUT -rp "节点${NODE_NUM} (输入 done 结束): "
 
         if [ "$INPUT" = "done" ] || [ "$INPUT" = "d" ] || [ -z "$INPUT" ]; then
             if [ ${#NODES[@]} -eq 0 ]; then
@@ -954,10 +967,10 @@ collect_nodes() {
                 echo -e "${YELLOW}你还没有添加任何住宅 SOCKS5 节点。${NC}"
                 echo -e "${YELLOW}是否创建一个 443 端口的 VPS 直连节点作为起点？${NC}"
                 local EMPTY_CHOICE
-                read -rp "输入 y 创建直连起步节点 / 其他键继续录入: " EMPTY_CHOICE
+                prompt_read EMPTY_CHOICE -rp "输入 y 创建直连起步节点 / 其他键继续录入: "
                 if [ "$EMPTY_CHOICE" = "y" ] || [ "$EMPTY_CHOICE" = "Y" ]; then
                     local DIRECT_NAME
-                    read -rp "  备注名称 (如 LA-Direct / JP-Direct，回车默认 VPS-Direct): " DIRECT_NAME
+                    prompt_read DIRECT_NAME -rp "  备注名称 (如 LA-Direct / JP-Direct，回车默认 VPS-Direct): "
                     [ -z "$DIRECT_NAME" ] && DIRECT_NAME="VPS-Direct"
                     # 清理 URL 片段里的不安全字符（与其他节点录入保持一致）
                     DIRECT_NAME=$(echo "$DIRECT_NAME" | tr ' \t#?&\r\n' '-' | tr -s '-' | sed 's/^-//; s/-$//')
@@ -992,7 +1005,7 @@ collect_nodes() {
         fi
 
         local NODE_NAME
-        read -rp "  备注名称 (如 KR-Seoul / US-LA，回车跳过): " NODE_NAME
+        prompt_read NODE_NAME -rp "  备注名称 (如 KR-Seoul / US-LA，回车跳过): "
         [ -z "$NODE_NAME" ] && NODE_NAME="Node-${NODE_NUM}"
         NODE_NAME=$(echo "$NODE_NAME" | tr ' \t#?&\r\n' '-' | tr -s '-' | sed 's/^-//; s/-$//')
         [ -z "$NODE_NAME" ] && NODE_NAME="Node-${NODE_NUM}"
@@ -1657,7 +1670,7 @@ add_node() {
     local S_HOST="$PARSED_HOST" S_PORT="$PARSED_PORT" S_USER="$PARSED_USER" S_PASS="$PARSED_PASS"
 
     local NODE_NAME
-    read -rp "备注名称: " NODE_NAME
+    prompt_read NODE_NAME -rp "备注名称: "
     [ -z "$NODE_NAME" ] && NODE_NAME="Node-new"
     NODE_NAME=$(echo "$NODE_NAME" | tr ' \t#?&\r\n' '-' | tr -s '-' | sed 's/^-//; s/-$//')
     [ -z "$NODE_NAME" ] && NODE_NAME="Node-new"
@@ -1786,7 +1799,7 @@ add_direct_node() {
     echo -e "新的监听端口: ${NEW_PORT}"
 
     local NODE_NAME
-    read -rp "备注名称 (默认 VPS-Direct): " NODE_NAME
+    prompt_read NODE_NAME -rp "备注名称 (默认 VPS-Direct): "
     [ -z "$NODE_NAME" ] && NODE_NAME="VPS-Direct"
     NODE_NAME=$(echo "$NODE_NAME" | tr ' \t#?&\r\n' '-' | tr -s '-' | sed 's/^-//; s/-$//')
     [ -z "$NODE_NAME" ] && NODE_NAME="VPS-Direct"
@@ -1922,7 +1935,7 @@ show_status() {
     echo "  其他/回车) 跳过"
     echo ""
     local QR_CHOICE
-    read -rp "  选择要显示二维码的节点: " QR_CHOICE
+    prompt_read QR_CHOICE -rp "  选择要显示二维码的节点: "
 
     case "$QR_CHOICE" in
         a|A)
@@ -2189,7 +2202,7 @@ PYEOF
     echo "  r) 重置当前计数"
     echo "  c) 清除历史数据"
     echo "  其他) 返回"
-    read -rp "  选择: " ACTION
+    prompt_read ACTION -rp "  选择: "
     case $ACTION in
         r) xray api stats --server=127.0.0.1:10085 -reset 2>/dev/null
            echo -e "${GREEN}✓ 当前计数已重置${NC}";;
@@ -2231,8 +2244,8 @@ PYEOF
 
     echo ""
     local IDX NEW_PORT OLD_PORT
-    read -rp "选择要修改的节点编号: " IDX
-    read -rp "新端口号: " NEW_PORT
+    prompt_read IDX -rp "选择要修改的节点编号: "
+    prompt_read NEW_PORT -rp "新端口号: "
     if [ -z "$IDX" ] || [ -z "$NEW_PORT" ]; then
         echo -e "${RED}输入不能为空${NC}"; return
     fi
@@ -2378,7 +2391,7 @@ PYEOF
 
     echo ""
     local IDX DELETE_PORT
-    read -rp "选择要删除的节点编号: " IDX
+    prompt_read IDX -rp "选择要删除的节点编号: "
     if [ -z "$IDX" ]; then
         echo -e "${RED}输入不能为空${NC}"; return
     fi
@@ -2615,7 +2628,7 @@ PYEOF
 }
 
 uninstall() {
-    read -rp "确认卸载 Xray？(y/n): " CONFIRM
+    prompt_read CONFIRM -rp "确认卸载 Xray？(y/n): "
     if [ "$CONFIRM" = "y" ]; then
         systemctl stop xray 2>/dev/null || true
         systemctl disable xray 2>/dev/null || true
@@ -2633,7 +2646,7 @@ uninstall() {
         echo -e "${YELLOW}注意：配置备份 ${CONFIG_FILE}.bak.* 已保留，如需清理请手动删除${NC}"
         sysctl --system >/dev/null 2>&1 || true
         if [ -f /swapfile ]; then
-            read -rp "是否同时移除 /swapfile？(y/n): " RM_SWAP
+            prompt_read RM_SWAP -rp "是否同时移除 /swapfile？(y/n): "
             if [ "$RM_SWAP" = "y" ]; then
                 swapoff /swapfile 2>/dev/null || true
                 rm -f /swapfile
@@ -2656,7 +2669,7 @@ update_xray() {
     LATEST=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)
     [ -n "$LATEST" ] && echo -e "  最新版本: ${YELLOW}${LATEST}${NC}" || echo -e "  ${YELLOW}无法获取最新版本号${NC}"
 
-    read -rp "确认更新？(y/n): " CONFIRM
+    prompt_read CONFIRM -rp "确认更新？(y/n): "
     [ "$CONFIRM" != "y" ] && { echo "已取消"; return; }
 
     if ! run_xray_installer install; then
@@ -2692,11 +2705,11 @@ setup_mail() {
 
     echo -e "${CYAN}支持 Gmail / QQ邮箱 / 163 等${NC}"
     local SMTP_HOST SMTP_PORT MAIL_FROM MAIL_PASS MAIL_TO
-    read -rp "SMTP 服务器: " SMTP_HOST
-    read -rp "SMTP 端口 (587/465): " SMTP_PORT
-    read -rp "发件邮箱: " MAIL_FROM
-    read -rsp "邮箱密码/授权码: " MAIL_PASS; echo
-    read -rp "收件邮箱: " MAIL_TO
+    prompt_read SMTP_HOST -rp "SMTP 服务器: "
+    prompt_read SMTP_PORT -rp "SMTP 端口 (587/465): "
+    prompt_read MAIL_FROM -rp "发件邮箱: "
+    prompt_read MAIL_PASS -rsp "邮箱密码/授权码: "; echo
+    prompt_read MAIL_TO -rp "收件邮箱: "
 
     # 拒绝任何控制字符（\n \r \t 以及其他 0x00-0x1F）
     # msmtprc 是行式格式，不支持引号转义；含控制字符会破坏配置
@@ -2971,7 +2984,7 @@ monitor_menu() {
     echo "  d) 查看监控日志"
     echo "  e) 发送测试邮件"
     echo "  f) 返回主菜单"
-    read -rp "  选择: " MC
+    prompt_read MC -rp "  选择: "
     case $MC in
         a) setup_mail;;
         b) install_monitor;;
@@ -3015,7 +3028,7 @@ main_menu() {
     echo "  13) 批量添加住宅 SOCKS5 节点"
     echo "  0) 退出"
     echo ""
-    read -rp "请选择 [0-13]: " CHOICE
+    prompt_read CHOICE -rp "请选择 [0-13]: "
 
     case $CHOICE in
         1)
@@ -3045,7 +3058,7 @@ main_menu() {
         *)  echo -e "${RED}无效选项${NC}";;
     esac
     echo ""
-    read -rp "按回车键返回主菜单..." _
+    prompt_read _ -rp "按回车键返回主菜单..."
 }
 
 # ========== 启动前预检 ==========
@@ -3098,7 +3111,7 @@ preflight_check() {
         if [ -n "$who" ] && ! echo "$who" | grep -qi "xray"; then
             echo -e "${YELLOW}⚠ 检测到 443 端口被非 xray 进程占用: ${who}${NC}"
             echo -e "${YELLOW}  如继续部署，第一个节点将无法监听 443${NC}"
-            read -rp "  按回车继续，或 Ctrl+C 退出..." _
+            prompt_read _ -rp "  按回车继续，或 Ctrl+C 退出..."
         fi
     fi
 
