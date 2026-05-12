@@ -12,6 +12,11 @@
 #    - 订阅文件改为临时文件 + 原子替换写入
 #    - 测试可用 XRAY_BIN 指向 fake xray，避免本机未安装 xray 时误报
 #
+#  v2.2.3 修复点：
+#    - 批量输出链接时只格式化一次 VPS host，减少重复 python 启动
+#    - 修改端口时允许新旧端口相同的 no-op 输入
+#    - firewalld 旧端口不存在时提示无需回收，而不是报失败
+#
 #  v2.2 改进点：
 #    - 新增批量添加住宅 SOCKS5 节点，一次最多导入 20 个
 #    - 批量节点自动以 IP/host 命名，成功后逐条输出链接和二维码
@@ -79,7 +84,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.2     ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.3     ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -717,6 +722,10 @@ revoke_firewall_port() {
     fi
 
     if command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null; then
+        if ! firewall-cmd --zone=public --query-port="${port}/tcp" --permanent >/dev/null 2>&1; then
+            echo -e "  ${CYAN}ℹ firewalld 未找到 ${port}/tcp 放行规则，无需回收${NC}"
+            return 0
+        fi
         local fw_rm_rc=0 fw_reload_rc=0
         firewall-cmd --zone=public --remove-port="${port}/tcp" --permanent >/dev/null 2>&1 || fw_rm_rc=$?
         firewall-cmd --reload >/dev/null 2>&1 || fw_reload_rc=$?
@@ -1278,6 +1287,7 @@ short_id = os.environ["SHORT_ID"]
 client_fp = os.environ["CLIENT_FP"]
 reality_server_name = os.environ["REALITY_SERVER_NAME"]
 
+# FORMAT_VLESS_HOST_PY must come only from format_vless_host_py() above.
 exec(os.environ["FORMAT_VLESS_HOST_PY"])
 link_host = format_vless_host(vps_ip)
 
@@ -1597,9 +1607,9 @@ PYEOF
         echo ""
         echo -e "${GREEN}✓ 批量节点添加成功！共 ${#BATCH_NODES[@]} 个${NC}"
         REFRESH_NAME_PORT="" REFRESH_NAME="" refresh_info_file_from_config || true
+        LINK_HOST=$(format_vless_host "$VPS_IP")
         for line in "${BATCH_NODES[@]}"; do
             IFS=$'\x1f' read -r _ LISTEN_PORT S_HOST S_PORT _ _ NODE_NAME <<< "$line"
-            LINK_HOST=$(format_vless_host "$VPS_IP")
             LINK="vless://${UUID}@${LINK_HOST}:${LISTEN_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
             echo ""
             echo -e "${GREEN}━━━ ${NODE_NAME} ━━━${NC}"
@@ -2229,9 +2239,6 @@ PYEOF
     if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
         echo -e "${RED}端口必须是 1-65535 的整数${NC}"; return
     fi
-    if port_in_use "$NEW_PORT"; then
-        echo -e "${RED}端口 ${NEW_PORT} 已被占用${NC}"; return
-    fi
     if ! OLD_PORT=$(CONFIG_FILE="$CONFIG_FILE" IDX="$IDX" python3 << 'PYEOF'
 import json
 import os
@@ -2252,6 +2259,13 @@ PYEOF
     ); then
         echo -e "${RED}编号无效${NC}"
         return
+    fi
+    if [ "$NEW_PORT" = "$OLD_PORT" ]; then
+        echo -e "${YELLOW}新旧端口相同，无需修改${NC}"
+        return
+    fi
+    if port_in_use "$NEW_PORT"; then
+        echo -e "${RED}端口 ${NEW_PORT} 已被占用${NC}"; return
     fi
 
     local NEW_CONFIG

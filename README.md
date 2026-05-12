@@ -33,6 +33,15 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.3 关键改动
+
+- 批量添加成功后输出链接时，`format_vless_host` 只执行一次，避免最多 20 次重复启动 `python3`
+- 修改端口时如果新旧端口相同，会提示“无需修改”，不再因为当前监听端口被占用而误报
+- firewalld 回收旧端口前会先查询规则是否存在；不存在时提示无需回收，不再报失败
+- 给 `FORMAT_VLESS_HOST_PY` 的 `exec` 契约补充注释，避免未来误传用户输入
+
+---
+
 ## 🆕 v2.2.2 关键改动
 
 - 修改节点端口后会尽量回收旧端口的 `ufw` / `firewalld` / `nftables` / `iptables` 放行规则
