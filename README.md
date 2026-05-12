@@ -22,7 +22,7 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🎯 **固定端口映射**：每个前置节点绑定独立监听端口，客户端可精确选择出口，不做负载均衡
 - 🧩 **多节点管理**：菜单化添加、删除节点，修改端口
 - 🛟 **安全写配置**：生成临时 JSON → `xray run -test` 校验 → 备份旧配置 → 原子替换 → 启动失败自动回滚
-- 🧱 **自动防火墙放行**：依次尝试 `ufw` / `firewalld` / `nftables` / `iptables`，并尽量持久化规则，对云厂商安全组给出提醒
+- 🧱 **自动防火墙放行**：依次尝试 `ufw` / `firewalld` / `nftables` / `iptables`，nftables 会识别真实 input 链，尽量持久化规则，并对云厂商安全组给出提醒
 - 🔒 **供应链保护**：默认使用 Xray 官方安装脚本 `main` 分支，支持固定 commit 与 sha256 校验
 - ⚡ **BBR 加速**：自动开启 BBR 拥塞控制并写入内核调优参数
 - 📊 **流量统计**：基于 Xray API 的累计上行/下行流量查看
@@ -30,6 +30,15 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🚨 **监控报警**：可选配置邮件告警（Gmail/QQ/163 等 SMTP），每分钟巡检，异常自动发信
 - 📱 **终端二维码**：节点生成后直接在终端渲染 VLESS 二维码，主流客户端扫码即导入
 - 🐧 **多发行版支持**：Debian / Ubuntu / CentOS / AlmaLinux / Rocky / Fedora
+
+---
+
+## 🆕 v2.1.1 关键改动
+
+- 修复 nftables 只存在 fail2ban 表/链时被误判为「端口未放行」的问题
+- nftables 不再硬编码 `inet filter input`，会自动扫描实际存在的 input base chain
+- 当 nftables input 链默认策略为 `accept` 时，脚本会提示无需额外放行；只有默认 `drop` / `reject` 时才自动插入端口放行规则
+- 新增 nftables 防火墙识别测试，覆盖 fail2ban `f2b-table/f2b-chain` 与默认 drop 链场景
 
 ---
 
@@ -258,17 +267,18 @@ bash run_all_tests.sh
 - 节点信息解析
 - SMTP 输入校验
 - 防火墙返回码捕获链路
+- nftables input 链识别，包括 fail2ban 默认 accept 链与默认 drop 链
 - 流量统计首次记录 delta=0
 - 监控告警按故障详情去重
 - 节点备注写入配置并可恢复
 
-在 Debian 13 VPS 上的实测结果：
+当前测试结果：
 
 ```text
-通过: 11  失败: 0  跳过: 1
+通过: 13  失败: 0  跳过: 0
 ```
 
-跳过项为未安装 `shellcheck`。
+如果系统未安装 `shellcheck`，静态检查会自动跳过该项。
 
 ---
 
@@ -296,6 +306,8 @@ A: 运行菜单 `7) 排错诊断`，会依次检查：
 - 最近 1 小时 Xray 错误日志
 
 还需要确认云厂商安全组已放行对应 TCP 端口，例如 443、8443 等。脚本只能修改 VPS 系统内的防火墙，不能自动修改云厂商控制台里的安全组。
+
+如果系统使用 nftables，脚本会自动识别实际 input 链名。像 fail2ban 创建的 `f2b-table/f2b-chain` 且默认策略为 `accept` 的场景，不需要额外添加 `inet filter input` 规则；真正默认 `drop` / `reject` 的 input 链才需要插入端口放行规则。
 
 常用排查命令：
 
