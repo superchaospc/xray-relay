@@ -23,13 +23,26 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🧩 **多节点管理**：菜单化添加、批量导入、删除节点，修改端口
 - 🛟 **安全写配置**：生成临时 JSON → `xray run -test` 校验 → 备份旧配置 → 原子替换 → 启动失败自动回滚
 - 🧱 **自动防火墙放行**：依次尝试 `ufw` / `firewalld` / `nftables` / `iptables`，nftables 会识别真实 input 链，尽量持久化规则，并对云厂商安全组给出提醒
-- 🔒 **供应链保护**：默认使用 Xray 官方安装脚本 `main` 分支，支持固定 commit 与 sha256 校验
+- 🔒 **供应链保护**：默认固定 Xray 官方安装脚本 commit 并校验 sha256，也支持显式切回 `main`
 - ⚡ **BBR 加速**：自动开启 BBR 拥塞控制并写入内核调优参数
 - 📊 **流量统计**：基于 Xray API 的累计上行/下行流量查看
 - 🩺 **排错诊断**：一键检查服务、配置、端口、防火墙、前置连通性、BBR、系统资源和错误日志
 - 🚨 **监控报警**：可选配置邮件告警（Gmail/QQ/163 等 SMTP），每分钟巡检，异常自动发信
 - 📱 **终端二维码**：节点生成后直接在终端渲染 VLESS 二维码，主流客户端扫码即导入
 - 🐧 **多发行版支持**：Debian / Ubuntu / CentOS / AlmaLinux / Rocky / Fedora
+
+---
+
+## 🆕 v2.2.6 关键改动
+
+- `config.json` 改为 `root:<Xray 服务用户主组>` + `640`，避免本地非服务用户读取 UUID/REALITY 私钥
+- 监控邮件配置不再直接 `source`，改用受限 `KEY=VALUE` 解析，并收紧邮箱字符集以阻断 shell 注入
+- nftables 默认不再覆盖既有 `/etc/nftables.conf`；如确认需要用当前 ruleset 覆盖，可设置 `XRAY_NFTABLES_OVERWRITE=1`
+- 卸载清理 cron 前会先确认存在 `xray_traffic_record`，避免无匹配项时写入空 crontab
+- `get_ip` 会校验自动获取和缓存内容必须是合法 IP，避免 HTML/错误页进入 VLESS 链接
+- UFW 放行改为显式 `${port}/tcp`
+- Xray 官方安装脚本默认值从 `main` 改为固定 commit + sha256 校验
+- 新增 SMTP 注入、非法公网 IP、卸载 cron 清理等回归测试
 
 ---
 

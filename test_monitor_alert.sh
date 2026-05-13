@@ -19,6 +19,16 @@ if grep -Fq 'LOCK_KEY=$(printf "%s" "$BODY" | md5sum' <<< "$MONITOR_SNIPPET"; th
     exit 1
 fi
 
+if grep -Fq 'source "$MONITOR_CONF"' <<< "$MONITOR_SNIPPET"; then
+    echo "监控脚本仍直接 source 配置文件"
+    exit 1
+fi
+
+if ! grep -Fq 'load_monitor_conf' <<< "$MONITOR_SNIPPET"; then
+    echo "监控脚本未使用受限配置解析"
+    exit 1
+fi
+
 key_a="$(printf "%s" "[警告] 内存使用率 91%" | sed -E 's/[0-9]+/N/g' | md5sum | cut -d' ' -f1)"
 key_b="$(printf "%s" "[警告] 内存使用率 99%" | sed -E 's/[0-9]+/N/g' | md5sum | cut -d' ' -f1)"
 key_c="$(printf "%s" "[故障] 端口 8444 未监听" | sed -E 's/[0-9]+/N/g' | md5sum | cut -d' ' -f1)"

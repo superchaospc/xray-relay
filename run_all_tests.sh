@@ -49,6 +49,7 @@ run "test_subscription_file.sh (订阅文件生成)" bash test_subscription_file
 run "test_smtp_validate.sh (SMTP 输入校验)" bash test_smtp_validate.sh
 run "test_firewall_capture.sh (防火墙 rc 链路)" bash test_firewall_capture.sh
 run "test_nft_firewall.sh (nftables 链识别)" bash test_nft_firewall.sh
+run "test_crontab_cleanup.sh (卸载 cron 清理)" bash test_crontab_cleanup.sh
 run "test_delete_node_outbound_match.sh (删除节点 outbound 精确匹配)" bash test_delete_node_outbound_match.sh
 run "test_traffic_record.sh (流量统计首次 delta)" bash test_traffic_record.sh
 run "test_monitor_alert.sh (监控告警去重)" bash test_monitor_alert.sh

@@ -8,9 +8,10 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 HELPER="$TMP_DIR/get_ip.sh"
 awk '
+    /is_valid_ip_literal\(\) \{/ {inside=1}
     /get_ip\(\) \{/ {inside=1}
     inside {print}
-    inside && /^}/ {exit}
+    inside && /^}/ {inside=0}
 ' "$ROOT/xray_deploy.sh" > "$HELPER"
 
 cat > "$TMP_DIR/curl" << 'EOF'
@@ -43,3 +44,34 @@ if ! printf '%s\n' "$out" | grep -Fq "无法获取 VPS 公网 IP"; then
 fi
 
 echo "get ip eof ok"
+
+cat > "$TMP_DIR/curl" << 'EOF'
+#!/bin/sh
+printf '%s\n' '<html>bad gateway</html>'
+exit 0
+EOF
+chmod +x "$TMP_DIR/curl"
+
+set +e
+out="$(
+    PATH="$TMP_DIR:$PATH" \
+    IP_CACHE_FILE="$TMP_DIR/ip.cache" \
+    IP_CACHE_TTL=3600 \
+    RED="" YELLOW="" NC="" \
+    bash -c "source '$HELPER'; get_ip" </dev/null 2>&1
+)"
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ]; then
+    echo "get_ip 收到 HTML 响应时应返回非零，实际 rc=0"
+    printf '%s\n' "$out"
+    exit 1
+fi
+
+if [ -f "$TMP_DIR/ip.cache" ] && grep -Fq '<html>' "$TMP_DIR/ip.cache"; then
+    echo "get_ip 不应缓存非法 IP 响应"
+    exit 1
+fi
+
+echo "get ip invalid response ok"

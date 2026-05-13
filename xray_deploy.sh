@@ -3,6 +3,13 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.6 修复点：
+#    - config.json 改为 root:xray服务组 640，避免本地非服务用户读取敏感配置
+#    - 监控邮件配置不再 source，改用受限 KEY=VALUE 解析并收紧邮箱校验
+#    - nftables 默认不覆盖既有 /etc/nftables.conf，需 XRAY_NFTABLES_OVERWRITE=1 才覆盖
+#    - 卸载时仅在存在 xray_traffic_record cron 项时才重写 crontab
+#    - get_ip 校验公网 IP 响应，避免缓存 HTML/错误页
+#
 #  v2.2.5 修复点：
 #    - 修复删除节点时 socks5-out-1 误匹配 socks5-out-10 的孤儿 outbound 问题
 #    - nftables 改用 JSON 解析端口规则，避免端口范围被误判为已放行
@@ -60,6 +67,8 @@ SYSCTL_FILE="/etc/sysctl.d/99-xray.conf"
 IP_CACHE_FILE="/root/.xray_vps_ip"
 # VPS 公网 IP 缓存时间（秒）。EIP / 浮动 IP 切换后最多等 1 小时自动刷新。
 IP_CACHE_TTL="${IP_CACHE_TTL:-3600}"
+# nftables 持久化配置文件。默认不会覆盖既有文件，除非设置 XRAY_NFTABLES_OVERWRITE=1。
+NFTABLES_CONF="${NFTABLES_CONF:-/etc/nftables.conf}"
 # 客户端指纹（chrome / firefox / safari / ios / android / edge / random）
 CLIENT_FP="${CLIENT_FP:-chrome}"
 # REALITY 伪装目标，可用环境变量覆盖：
@@ -69,17 +78,14 @@ REALITY_DEST="${REALITY_DEST:-${REALITY_SERVER_NAME}:443}"
 #
 # === Xray 官方安装脚本来源（供应链安全） ===
 #
-# 默认使用 XTLS/Xray-install 的 main 分支，方便一键部署到新 VPS。
-# 生产环境推荐把 XRAY_INSTALL_REF_DEFAULT 改成你审计过的具体 commit SHA：
-#     XRAY_INSTALL_REF_DEFAULT="2f37cdc7a76ab8d6a5e3a7f0e5d2cafe..."
-#     可选附加 sha256 校验：
-#     XRAY_INSTALL_SHA256_DEFAULT="<sha256 of install-release.sh at that commit>"
-#     拿到方法：
+# 默认 pin 到已核对的 XTLS/Xray-install commit + install-release.sh sha256。
+# 如需主动追新，可运行前显式指定 XRAY_INSTALL_REF=main XRAY_INSTALL_SHA256=。
+# 更新默认 pin 的方法：
 #       git ls-remote https://github.com/XTLS/Xray-install.git refs/heads/main
 #       curl -L https://raw.githubusercontent.com/XTLS/Xray-install/<COMMIT>/install-release.sh \
 #         | sha256sum
-XRAY_INSTALL_REF_DEFAULT="main"
-XRAY_INSTALL_SHA256_DEFAULT=""
+XRAY_INSTALL_REF_DEFAULT="e741a4f56d368afbb9e5be3361b40c4552d3710d"
+XRAY_INSTALL_SHA256_DEFAULT="7f70c95f6b418da8b4f4883343d602964915e28748993870fd554383afdbe555"
 XRAY_INSTALL_REF="${XRAY_INSTALL_REF:-$XRAY_INSTALL_REF_DEFAULT}"
 XRAY_INSTALL_SHA256="${XRAY_INSTALL_SHA256:-$XRAY_INSTALL_SHA256_DEFAULT}"
 # 是否在敏感输出中隐藏 UUID/密码片段（设 1 启用）
@@ -92,7 +98,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.5     ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.6     ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -118,23 +124,43 @@ prompt_read() {
     fi
 }
 
+is_valid_ip_literal() {
+    python3 - "$1" <<'PYEOF'
+import ipaddress
+import sys
+
+value = sys.argv[1]
+try:
+    if value != value.strip() or not value:
+        raise ValueError
+    ipaddress.ip_address(value)
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
 get_ip() {
     if [ -f "$IP_CACHE_FILE" ]; then
         local cache_age=$(( $(date +%s) - $(stat -c %Y "$IP_CACHE_FILE" 2>/dev/null || echo 0) ))
         if [ "$cache_age" -lt "$IP_CACHE_TTL" ]; then
             local cached_ip
             cached_ip=$(cat "$IP_CACHE_FILE" 2>/dev/null)
-            if [ -n "$cached_ip" ]; then
+            if is_valid_ip_literal "$cached_ip"; then
                 echo "$cached_ip"
                 return
             fi
+            rm -f "$IP_CACHE_FILE" 2>/dev/null || true
         fi
     fi
 
-    local IP
-    IP=$(curl -s4 --max-time 5 ip.sb 2>/dev/null || \
-         curl -s4 --max-time 5 ifconfig.me 2>/dev/null || \
-         curl -s4 --max-time 5 icanhazip.com 2>/dev/null || true)
+    local IP="" candidate provider
+    for provider in ip.sb ifconfig.me icanhazip.com; do
+        candidate=$(curl -s4 --max-time 5 "$provider" 2>/dev/null || true)
+        if is_valid_ip_literal "$candidate"; then
+            IP="$candidate"
+            break
+        fi
+    done
     if [ -z "$IP" ]; then
         echo -e "${RED}无法获取本机公网 IP，请手动输入:${NC}" >&2
         if ! read -rp "VPS 公网 IP: " IP; then
@@ -143,8 +169,8 @@ get_ip() {
             return 1
         fi
     fi
-    if [ -z "$IP" ]; then
-        echo -e "${RED}VPS 公网 IP 不能为空${NC}" >&2
+    if ! is_valid_ip_literal "$IP"; then
+        echo -e "${RED}VPS 公网 IP 格式无效${NC}" >&2
         return 1
     fi
 
@@ -372,6 +398,31 @@ read_socks5() {
 #   4. 原子 mv 替换
 # 调用方只需提供一个把 NEW_CONFIG_FILE 路径读取并输出到该路径的 python 闭包
 # 这里采用更直接的契约：调用方先把新配置写到 $1（临时文件），本函数负责其后的校验/替换
+detect_xray_service_group() {
+    local service_user service_group
+    service_user=$(systemctl show -p User --value xray 2>/dev/null | head -n1 || true)
+    if [ -z "$service_user" ] && command -v systemctl &>/dev/null; then
+        service_user=$(systemctl cat xray 2>/dev/null | awk -F= '/^[[:space:]]*User=/{print $2; exit}' || true)
+    fi
+    service_user="${service_user:-nobody}"
+
+    if id "$service_user" >/dev/null 2>&1; then
+        service_group=$(id -gn "$service_user" 2>/dev/null || true)
+        if [ -n "$service_group" ]; then
+            printf '%s\n' "$service_group"
+            return 0
+        fi
+    fi
+
+    if getent group nogroup >/dev/null 2>&1; then
+        printf '%s\n' "nogroup"
+    elif getent group nobody >/dev/null 2>&1; then
+        printf '%s\n' "nobody"
+    else
+        printf '%s\n' "root"
+    fi
+}
+
 validate_and_install_config() {
     local new_config="$1"
     if [ ! -s "$new_config" ]; then
@@ -400,11 +451,10 @@ validate_and_install_config() {
         echo -e "${YELLOW}⚠ xray 二进制尚未安装，跳过 -test 校验${NC}"
     fi
 
-    # config.json 必须让 xray 服务用户(nobody)能读
+    # config.json 必须让 xray 服务用户能读
     # 历史教训：盲目继承现有文件 owner/group 会延续错误（一旦老文件是 600 root:root，
-    # 新文件继续 600，nobody 永远读不到，启动 permission denied）
-    # 直接强制 644 root:root：/usr/local/etc/xray/ 目录默认 755 只有 root 能进入，
-    # 即便文件 644 也不会泄露给非特权本地用户
+    # 新文件继续 600，非 root 服务用户永远读不到，启动 permission denied）
+    # 因此强制 root:<xray服务用户主组> 640，避免本地其他用户读取 UUID/私钥。
 
     # 备份原配置
     if [ -f "$CONFIG_FILE" ]; then
@@ -418,10 +468,12 @@ validate_and_install_config() {
         echo -e "  ✓ 已备份原配置: $backup"
     fi
 
-    # 原子替换 + 强制权限到 nobody 可读
+    # 原子替换 + 强制权限到 xray 服务组可读
+    local config_group
+    config_group=$(detect_xray_service_group)
     mv "$new_config" "$CONFIG_FILE"
-    chown root:root "$CONFIG_FILE" 2>/dev/null || true
-    chmod 644 "$CONFIG_FILE"
+    chown "root:${config_group}" "$CONFIG_FILE" 2>/dev/null || chown root:root "$CONFIG_FILE" 2>/dev/null || true
+    chmod 640 "$CONFIG_FILE"
     return 0
 }
 
@@ -551,6 +603,12 @@ format_fw_revoke_status() {
 
 persist_nftables_rules() {
     local tmp_conf backup
+    if [ -f "$NFTABLES_CONF" ] && [ "${XRAY_NFTABLES_OVERWRITE:-0}" != "1" ]; then
+        echo -e "  ${YELLOW}⚠ 检测到既有 ${NFTABLES_CONF}，为避免覆盖 include/变量/注释，本次不自动持久化${NC}"
+        echo -e "  ${CYAN}ℹ 如确认要用当前 ruleset 覆盖它，可设置 XRAY_NFTABLES_OVERWRITE=1 后重试${NC}"
+        return 2
+    fi
+
     tmp_conf=$(mktemp /tmp/.xray-nftables.XXXXXX.conf) || return 1
 
     if ! nft list ruleset > "$tmp_conf" 2>/dev/null; then
@@ -564,17 +622,17 @@ persist_nftables_rules() {
         return 1
     fi
 
-    if [ -f /etc/nftables.conf ]; then
-        backup="/etc/nftables.conf.bak.$(date +%Y%m%d-%H%M%S)"
-        cp -a /etc/nftables.conf "$backup" 2>/dev/null || true
+    if [ -f "$NFTABLES_CONF" ]; then
+        backup="${NFTABLES_CONF}.bak.$(date +%Y%m%d-%H%M%S)"
+        cp -a "$NFTABLES_CONF" "$backup" 2>/dev/null || true
         [ -n "${backup:-}" ] && echo -e "  ${CYAN}ℹ 已备份 nftables 配置: ${backup}${NC}"
     fi
 
-    if ! mv "$tmp_conf" /etc/nftables.conf; then
+    if ! mv "$tmp_conf" "$NFTABLES_CONF"; then
         rm -f "$tmp_conf"
         return 1
     fi
-    chmod 600 /etc/nftables.conf 2>/dev/null || true
+    chmod 600 "$NFTABLES_CONF" 2>/dev/null || true
 
     if command -v systemctl &>/dev/null; then
         systemctl enable nftables >/dev/null 2>&1 || true
@@ -692,7 +750,7 @@ apply_firewall_port() {
 
     # UFW
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        if ufw allow "$port" >/dev/null 2>&1; then
+        if ufw allow "${port}/tcp" >/dev/null 2>&1; then
             echo -e "  ${CYAN}ℹ 提醒：云厂商安全组仍需手动放行 ${port}/tcp${NC}"
             return 0
         fi
@@ -755,9 +813,14 @@ apply_firewall_port() {
         if [ "$nft_failed" -eq 0 ]; then
             if [ "$nft_changed" -eq 1 ]; then
                 if persist_nftables_rules; then
-                    echo -e "  ${GREEN}✓ nftables 规则已持久化到 /etc/nftables.conf${NC}"
+                    echo -e "  ${GREEN}✓ nftables 规则已持久化到 ${NFTABLES_CONF}${NC}"
                 else
-                    echo -e "  ${YELLOW}⚠ nftables 当前已放行，但自动持久化失败，重启后可能失效${NC}"
+                    local persist_rc=$?
+                    if [ "$persist_rc" -eq 2 ]; then
+                        echo -e "  ${YELLOW}⚠ nftables 当前已放行，但未覆盖既有配置；重启后可能失效${NC}"
+                    else
+                        echo -e "  ${YELLOW}⚠ nftables 当前已放行，但自动持久化失败，重启后可能失效${NC}"
+                    fi
                 fi
             fi
             echo -e "  ${CYAN}ℹ 提醒：云厂商安全组仍需手动放行 ${port}/tcp${NC}"
@@ -861,7 +924,12 @@ revoke_firewall_port() {
             if persist_nftables_rules; then
                 echo -e "  ${CYAN}ℹ 已从 nftables 回收 ${port}/tcp 并持久化；云厂商安全组仍需手动清理${NC}"
             else
-                echo -e "  ${YELLOW}⚠ nftables 当前已回收 ${port}/tcp，但自动持久化失败${NC}"
+                local persist_rc=$?
+                if [ "$persist_rc" -eq 2 ]; then
+                    echo -e "  ${YELLOW}⚠ nftables 当前已回收 ${port}/tcp，但未覆盖既有配置；重启后可能恢复${NC}"
+                else
+                    echo -e "  ${YELLOW}⚠ nftables 当前已回收 ${port}/tcp，但自动持久化失败${NC}"
+                fi
             fi
         elif [ "$nft_seen_input" -eq 1 ]; then
             echo -e "  ${CYAN}ℹ nftables 未找到 ${port}/tcp 放行规则，无需回收${NC}"
@@ -2727,6 +2795,15 @@ PYEOF
     echo ""
 }
 
+remove_traffic_cron() {
+    local tmp_cron
+    tmp_cron=$(mktemp /tmp/.xray-crontab.XXXXXX) || return 1
+    if crontab -l > "$tmp_cron" 2>/dev/null && grep -q "xray_traffic_record" "$tmp_cron"; then
+        grep -v "xray_traffic_record" "$tmp_cron" | crontab - 2>/dev/null || true
+    fi
+    rm -f "$tmp_cron"
+}
+
 uninstall() {
     prompt_read CONFIRM -rp "确认卸载 Xray？(y/n): "
     if [ "$CONFIRM" = "y" ]; then
@@ -2738,7 +2815,7 @@ uninstall() {
         rm -f /etc/systemd/system/xray-monitor.service /etc/systemd/system/xray-monitor.timer
         rm -rf /etc/systemd/system/xray.service.d
         systemctl daemon-reload 2>/dev/null || true
-        (crontab -l 2>/dev/null || true) | grep -v "xray_traffic_record" | crontab - 2>/dev/null || true
+        remove_traffic_cron || true
         rm -f "$CONFIG_FILE" "$INFO_FILE" "$SUB_FILE" "$SYSCTL_FILE" /root/.xray_traffic_db /root/.xray_traffic_record.sh \
               /root/.xray_monitor.conf /root/.xray_monitor.sh /root/.xray_vps_ip /root/.msmtprc \
               /tmp/.xray_node_failures /tmp/.xray_alert_lock_*
@@ -2787,6 +2864,52 @@ MONITOR_CONF="/root/.xray_monitor.conf"
 MONITOR_SCRIPT="/root/.xray_monitor.sh"
 MONITOR_LOG="/var/log/xray/monitor.log"
 
+validate_email_addr() {
+    local email="$1"
+    [[ "$email" =~ ^[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+\.)+[A-Za-z]{2,63}$ ]]
+}
+
+load_monitor_conf() {
+    [ -f "$MONITOR_CONF" ] || return 1
+    MAIL_TO=""
+    MAIL_FROM=""
+    AUTO_RESTART="yes"
+
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|\#*) continue ;;
+            *=*)
+                key="${line%%=*}"
+                value="${line#*=}"
+                ;;
+            *)
+                echo -e "${RED}✗ 监控配置格式错误: $line${NC}" >&2
+                return 1
+                ;;
+        esac
+
+        case "$key" in
+            MAIL_TO) MAIL_TO="$value" ;;
+            MAIL_FROM) MAIL_FROM="$value" ;;
+            AUTO_RESTART) AUTO_RESTART="$value" ;;
+            *)
+                echo -e "${RED}✗ 监控配置含未知字段: $key${NC}" >&2
+                return 1
+                ;;
+        esac
+    done < "$MONITOR_CONF"
+
+    if ! validate_email_addr "$MAIL_FROM" || ! validate_email_addr "$MAIL_TO"; then
+        echo -e "${RED}✗ 监控配置中的邮箱格式无效${NC}" >&2
+        return 1
+    fi
+    case "$AUTO_RESTART" in
+        yes|no) ;;
+        *) echo -e "${RED}✗ AUTO_RESTART 只能是 yes 或 no${NC}" >&2; return 1 ;;
+    esac
+}
+
 build_mail() {
     local subject="$1" body="$2" from="$3" to="$4"
     printf "Subject: %s\r\nFrom: %s\r\nTo: %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s" \
@@ -2825,11 +2948,11 @@ setup_mail() {
     if ! [[ "$SMTP_PORT" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}✗ SMTP 端口必须是纯数字${NC}"; return 1
     fi
-    # 邮箱地址简单格式（msmtp 不会做严格检查，但避免明显错误）
-    if [[ ! "$MAIL_FROM" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+    # 邮箱地址采用保守字符集，避免写入监控配置后出现 shell 元字符风险
+    if ! validate_email_addr "$MAIL_FROM"; then
         echo -e "${RED}✗ 发件邮箱格式可疑: $MAIL_FROM${NC}"; return 1
     fi
-    if [[ ! "$MAIL_TO" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+    if ! validate_email_addr "$MAIL_TO"; then
         echo -e "${RED}✗ 收件邮箱格式可疑: $MAIL_TO${NC}"; return 1
     fi
 
@@ -2884,12 +3007,32 @@ with os.fdopen(fd, "w") as f:
     f.write(content)
 PYEOF
 
-    cat > "$MONITOR_CONF" << EOF
-MAIL_TO=${MAIL_TO}
-MAIL_FROM=${MAIL_FROM}
-AUTO_RESTART=yes
-EOF
-    chmod 600 "$MONITOR_CONF"
+    if ! MONITOR_CONF="$MONITOR_CONF" MAIL_TO="$MAIL_TO" MAIL_FROM="$MAIL_FROM" python3 << 'PYEOF'
+import os
+import re
+import sys
+
+def sanitize_email(name):
+    value = os.environ[name]
+    if re.search(r'[\x00-\x1f\x7f]', value):
+        print(f"ERR: {name} 含控制字符", file=sys.stderr)
+        sys.exit(1)
+    if not re.fullmatch(r'[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}', value):
+        print(f"ERR: {name} 邮箱格式无效", file=sys.stderr)
+        sys.exit(1)
+    return value
+
+mail_to = sanitize_email("MAIL_TO")
+mail_from = sanitize_email("MAIL_FROM")
+content = f"MAIL_TO={mail_to}\nMAIL_FROM={mail_from}\nAUTO_RESTART=yes\n"
+fd = os.open(os.environ["MONITOR_CONF"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(content)
+PYEOF
+    then
+        echo -e "${RED}✗ 监控配置写入失败${NC}"
+        return 1
+    fi
 
     echo -e "${YELLOW}发送测试邮件...${NC}"
     TEST_BODY="Xray 监控报警测试
@@ -2907,7 +3050,7 @@ install_monitor() {
     if [ ! -f "$MONITOR_CONF" ]; then
         echo -e "${RED}请先配置邮件通知（选 a）${NC}"; return
     fi
-    source "$MONITOR_CONF"
+    load_monitor_conf || return 1
 
     cat > "$MONITOR_SCRIPT" << 'MONEOF'
 #!/bin/bash
@@ -2915,11 +3058,58 @@ CONFIG_FILE="/usr/local/etc/xray/config.json"
 MONITOR_CONF="/root/.xray_monitor.conf"
 MONITOR_LOG="/var/log/xray/monitor.log"
 ALERT_LOCK="/tmp/.xray_alert_lock"
-source "$MONITOR_CONF"
 HOSTNAME=$(hostname)
 NOW=$(date "+%Y-%m-%d %H:%M:%S")
 
 log() { echo "[$NOW] $1" >> "$MONITOR_LOG"; }
+
+validate_email_addr() {
+    local email="$1"
+    [[ "$email" =~ ^[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+\.)+[A-Za-z]{2,63}$ ]]
+}
+
+load_monitor_conf() {
+    [ -f "$MONITOR_CONF" ] || exit 1
+    MAIL_TO=""
+    MAIL_FROM=""
+    AUTO_RESTART="yes"
+
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|\#*) continue ;;
+            *=*)
+                key="${line%%=*}"
+                value="${line#*=}"
+                ;;
+            *)
+                log "ERROR: monitor config invalid line"
+                exit 1
+                ;;
+        esac
+
+        case "$key" in
+            MAIL_TO) MAIL_TO="$value" ;;
+            MAIL_FROM) MAIL_FROM="$value" ;;
+            AUTO_RESTART) AUTO_RESTART="$value" ;;
+            *)
+                log "ERROR: monitor config unknown key: $key"
+                exit 1
+                ;;
+        esac
+    done < "$MONITOR_CONF"
+
+    if ! validate_email_addr "$MAIL_FROM" || ! validate_email_addr "$MAIL_TO"; then
+        log "ERROR: monitor config invalid email"
+        exit 1
+    fi
+    case "$AUTO_RESTART" in
+        yes|no) ;;
+        *) log "ERROR: AUTO_RESTART must be yes or no"; exit 1 ;;
+    esac
+}
+
+load_monitor_conf
 
 send_alert() {
     local SUBJECT="$1" BODY="$2"
@@ -3094,7 +3284,7 @@ monitor_menu() {
         d) show_monitor_log;;
         e)
             if [ -f "$MONITOR_CONF" ]; then
-                source "$MONITOR_CONF"
+                load_monitor_conf || return 1
                 if ! VPS_IP=$(get_ip); then
                     return 1
                 fi

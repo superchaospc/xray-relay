@@ -34,7 +34,7 @@ validate_and_install_config() {
         ls -1t "${CONFIG_FILE}.bak."* 2>/dev/null | tail -n +"$((CONFIG_BACKUP_KEEP+1))" | xargs -r rm -f
     fi
     mv "$new_config" "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE"
+    chmod 640 "$CONFIG_FILE"
     return 0
 }
 

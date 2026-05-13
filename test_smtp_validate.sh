@@ -3,6 +3,11 @@
 set -e
 
 # 内联校验函数（与脚本里 setup_mail 中的逻辑一致）
+validate_email_addr() {
+    local email="$1"
+    [[ "$email" =~ ^[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+\.)+[A-Za-z]{2,63}$ ]]
+}
+
 validate_smtp_inputs() {
     local SMTP_HOST="$1" SMTP_PORT="$2" MAIL_FROM="$3" MAIL_PASS="$4" MAIL_TO="$5"
     local v
@@ -14,10 +19,10 @@ validate_smtp_inputs() {
     if ! [[ "$SMTP_PORT" =~ ^[0-9]+$ ]]; then
         echo "REJECT: 端口非数字"; return 1
     fi
-    if [[ ! "$MAIL_FROM" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+    if ! validate_email_addr "$MAIL_FROM"; then
         echo "REJECT: 发件邮箱"; return 1
     fi
-    if [[ ! "$MAIL_TO" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+    if ! validate_email_addr "$MAIL_TO"; then
         echo "REJECT: 收件邮箱"; return 1
     fi
     echo "OK"
@@ -48,6 +53,9 @@ run_case "端口非数字" "REJECT" "smtp.gmail.com" "abc" "me@gmail.com" "pwd" 
 # 邮箱格式
 run_case "发件无 @" "REJECT" "smtp.gmail.com" "587" "no-at-sign" "pwd" "you@example.com"
 run_case "收件无 .com" "REJECT" "smtp.gmail.com" "587" "me@gmail.com" "pwd" "you@example"
+run_case "收件含命令替换" "REJECT" "smtp.gmail.com" "587" "me@gmail.com" "pwd" 'a$(touch /tmp/pwn).b@example.com'
+run_case "收件含反引号" "REJECT" "smtp.gmail.com" "587" "me@gmail.com" "pwd" 'a`touch /tmp/pwn`.b@example.com'
+run_case "收件含分号" "REJECT" "smtp.gmail.com" "587" "me@gmail.com" "pwd" 'a;b@example.com'
 
 # 控制字符 - 这些 case 用 $'...' 显式构造
 run_case "host 含 \\n" "REJECT" $'smtp\ngmail.com' "587" "me@gmail.com" "pwd" "you@example.com"
