@@ -85,5 +85,12 @@ if ! grep -Fq 'TLS_TRUST_FILE' xray_deploy.sh || ! grep -Fq '/etc/pki/tls/certs/
     exit 1
 fi
 
+warning_line=$(grep -n 'SMTP 密码/授权码会明文写入' xray_deploy.sh | head -1 | cut -d: -f1)
+pass_prompt_line=$(grep -n 'prompt_read MAIL_PASS' xray_deploy.sh | head -1 | cut -d: -f1)
+if [ "$warning_line" -ge "$pass_prompt_line" ]; then
+    echo "  ✗ SMTP 密码明文保存提醒应出现在密码输入前"
+    exit 1
+fi
+
 echo ""
 echo "全部测试通过 ✓"

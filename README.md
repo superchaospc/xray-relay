@@ -33,6 +33,15 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.8 关键改动
+
+- SMTP 密码/授权码明文保存提醒前移到密码输入之前，用户可在输入敏感信息前决定是否继续
+- `config.json` 权限归一化失败时会明确报错并中止安装/回滚流程，避免脚本误判成功
+- apt/apt-get 依赖安装统一添加 `--no-install-recommends`，减少推荐包体积
+- 新增 SMTP 明文提醒顺序回归测试
+
+---
+
 ## 🆕 v2.2.7 关键改动
 
 - 修复回滚后 `config.json` 从备份恢复为 `600 root:root`，导致非 root Xray 无法读取配置的问题

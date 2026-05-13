@@ -3,6 +3,11 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.8 修复点：
+#    - SMTP 密码明文保存提醒前移到密码输入之前
+#    - config.json 权限设置失败时显式报错并中止安装/回滚流程
+#    - apt/apt-get 依赖安装统一使用 --no-install-recommends
+#
 #  v2.2.7 修复点：
 #    - 回滚后重新归一化 config.json 为 root:xray服务组 640，避免非 root xray 读不到配置
 #    - systemctl restart 返回非零时仍继续执行回滚流程
@@ -104,7 +109,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.7     ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.8     ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -196,7 +201,7 @@ ensure_qrencode() {
     echo -e "${YELLOW}首次使用二维码功能，正在安装 qrencode...${NC}" >&2
     local rc=1
     if command -v apt-get &>/dev/null; then
-        apt-get install -y qrencode >/dev/null 2>&1 && rc=0 || rc=1
+        apt-get install -y --no-install-recommends qrencode >/dev/null 2>&1 && rc=0 || rc=1
     elif command -v dnf &>/dev/null; then
         dnf install -y qrencode >/dev/null 2>&1 && rc=0 || rc=1
     elif command -v yum &>/dev/null; then
@@ -438,7 +443,10 @@ apply_config_permissions() {
     local config_group
     config_group=$(detect_xray_service_group)
     chown "root:${config_group}" "$target" 2>/dev/null || chown root:root "$target" 2>/dev/null || true
-    chmod 640 "$target"
+    if ! chmod 640 "$target"; then
+        echo -e "${RED}✗ 无法设置配置文件权限: $target${NC}" >&2
+        return 1
+    fi
 }
 
 validate_and_install_config() {
@@ -483,7 +491,7 @@ validate_and_install_config() {
 
     # 原子替换 + 强制权限到 xray 服务组可读
     mv "$new_config" "$CONFIG_FILE"
-    apply_config_permissions "$CONFIG_FILE"
+    apply_config_permissions "$CONFIG_FILE" || return 1
     return 0
 }
 
@@ -526,7 +534,7 @@ restart_with_rollback() {
     fi
 
     cp -a "$last_backup" "$CONFIG_FILE"
-    apply_config_permissions "$CONFIG_FILE"
+    apply_config_permissions "$CONFIG_FILE" || return 1
     systemctl restart xray || true
     sleep 3
     if systemctl is-active --quiet xray; then
@@ -1036,7 +1044,7 @@ update_system() {
     if command -v apt &>/dev/null; then
         export DEBIAN_FRONTEND=noninteractive
         apt update -y || true
-        apt install -y curl python3 iproute2 ca-certificates qrencode || true
+        apt install -y --no-install-recommends curl python3 iproute2 ca-certificates qrencode || true
         if [ "${XRAY_FULL_UPGRADE:-0}" = "1" ]; then
             echo -e "  ${YELLOW}XRAY_FULL_UPGRADE=1，执行完整系统升级...${NC}"
             apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || true
@@ -2148,7 +2156,7 @@ ensure_cron_installed() {
     if command -v apt-get &>/dev/null; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -y >/dev/null 2>&1 || true
-        apt-get install -y cron >/dev/null 2>&1 || true
+        apt-get install -y --no-install-recommends cron >/dev/null 2>&1 || true
         systemctl enable --now cron >/dev/null 2>&1 || true
     elif command -v dnf &>/dev/null; then
         dnf install -y cronie >/dev/null 2>&1 || true
@@ -2979,6 +2987,7 @@ setup_mail() {
     fi
 
     echo -e "${CYAN}支持 Gmail / QQ邮箱 / 163 等${NC}"
+    echo -e "${YELLOW}提醒：SMTP 密码/授权码会明文写入 /root/.msmtprc（权限 600）。${NC}"
     local SMTP_HOST SMTP_PORT MAIL_FROM MAIL_PASS MAIL_TO
     prompt_read SMTP_HOST -rp "SMTP 服务器: "
     prompt_read SMTP_PORT -rp "SMTP 端口 (587/465): "
@@ -3010,8 +3019,6 @@ setup_mail() {
     if ! validate_email_addr "$MAIL_TO"; then
         echo -e "${RED}✗ 收件邮箱格式可疑: $MAIL_TO${NC}"; return 1
     fi
-
-    echo -e "${YELLOW}提醒：SMTP 密码/授权码会明文写入 /root/.msmtprc（权限 600）。${NC}"
 
     # 用 Python 安全写入 .msmtprc，并在 Python 端再做一道控制字符防御
     SMTP_HOST="$SMTP_HOST" SMTP_PORT="$SMTP_PORT" \
@@ -3437,7 +3444,7 @@ preflight_check() {
         if command -v apt &>/dev/null; then
             export DEBIAN_FRONTEND=noninteractive
             apt update -y >/dev/null 2>&1 || true
-            apt install -y python3 curl iproute2 qrencode >/dev/null 2>&1 || true
+            apt install -y --no-install-recommends python3 curl iproute2 qrencode >/dev/null 2>&1 || true
         elif command -v dnf &>/dev/null; then
             dnf install -y python3 curl iproute qrencode >/dev/null 2>&1 || true
         elif command -v yum &>/dev/null; then
