@@ -3,6 +3,12 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.7 修复点：
+#    - 回滚后重新归一化 config.json 为 root:xray服务组 640，避免非 root xray 读不到配置
+#    - systemctl restart 返回非零时仍继续执行回滚流程
+#    - msmtp CA bundle 自动兼容 Debian/RHEL 路径，SMTP 端口规范化并校验范围
+#    - msmtp 安装失败时立即中止，并提示 SMTP 密码会明文保存在 /root/.msmtprc
+#
 #  v2.2.6 修复点：
 #    - config.json 改为 root:xray服务组 640，避免本地非服务用户读取敏感配置
 #    - 监控邮件配置不再 source，改用受限 KEY=VALUE 解析并收紧邮箱校验
@@ -98,7 +104,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.6     ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.7     ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -423,6 +429,18 @@ detect_xray_service_group() {
     fi
 }
 
+apply_config_permissions() {
+    # config.json 必须让 xray 服务用户能读。
+    # 历史教训：盲目继承现有文件 owner/group 会延续错误（一旦老文件是 600 root:root，
+    # 新文件继续 600，非 root 服务用户永远读不到，启动 permission denied）。
+    # 因此强制 root:<xray服务用户主组> 640，避免本地其他用户读取 UUID/私钥。
+    local target="${1:-$CONFIG_FILE}"
+    local config_group
+    config_group=$(detect_xray_service_group)
+    chown "root:${config_group}" "$target" 2>/dev/null || chown root:root "$target" 2>/dev/null || true
+    chmod 640 "$target"
+}
+
 validate_and_install_config() {
     local new_config="$1"
     if [ ! -s "$new_config" ]; then
@@ -451,11 +469,6 @@ validate_and_install_config() {
         echo -e "${YELLOW}⚠ xray 二进制尚未安装，跳过 -test 校验${NC}"
     fi
 
-    # config.json 必须让 xray 服务用户能读
-    # 历史教训：盲目继承现有文件 owner/group 会延续错误（一旦老文件是 600 root:root，
-    # 新文件继续 600，非 root 服务用户永远读不到，启动 permission denied）
-    # 因此强制 root:<xray服务用户主组> 640，避免本地其他用户读取 UUID/私钥。
-
     # 备份原配置
     if [ -f "$CONFIG_FILE" ]; then
         local ts backup
@@ -469,11 +482,8 @@ validate_and_install_config() {
     fi
 
     # 原子替换 + 强制权限到 xray 服务组可读
-    local config_group
-    config_group=$(detect_xray_service_group)
     mv "$new_config" "$CONFIG_FILE"
-    chown "root:${config_group}" "$CONFIG_FILE" 2>/dev/null || chown root:root "$CONFIG_FILE" 2>/dev/null || true
-    chmod 640 "$CONFIG_FILE"
+    apply_config_permissions "$CONFIG_FILE"
     return 0
 }
 
@@ -500,7 +510,7 @@ create_config_workfile() {
 
 # 重启 xray 并在失败时回滚到最近备份
 restart_with_rollback() {
-    systemctl restart xray
+    systemctl restart xray || true
     sleep 3
     if systemctl is-active --quiet xray; then
         return 0
@@ -516,15 +526,16 @@ restart_with_rollback() {
     fi
 
     cp -a "$last_backup" "$CONFIG_FILE"
-    systemctl restart xray
+    apply_config_permissions "$CONFIG_FILE"
+    systemctl restart xray || true
     sleep 3
     if systemctl is-active --quiet xray; then
-        echo -e "${GREEN}✓ 已回滚到 $last_backup，Xray 恢复运行${NC}"
+        echo -e "${GREEN}✓ 已回滚到 ${last_backup}，Xray 恢复运行${NC}"
         return 1   # 业务上仍然算"操作失败"
     fi
 
     echo -e "${RED}✗ 回滚后 Xray 仍未启动，请手动排查${NC}"
-    echo -e "${YELLOW}  备份位置: $last_backup${NC}"
+    echo -e "${YELLOW}  备份位置: ${last_backup}${NC}"
     return 1
 }
 
@@ -2910,6 +2921,21 @@ load_monitor_conf() {
     esac
 }
 
+detect_tls_trust_file() {
+    local path
+    for path in \
+        /etc/ssl/certs/ca-certificates.crt \
+        /etc/pki/tls/certs/ca-bundle.crt \
+        /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+    do
+        if [ -f "$path" ]; then
+            printf '%s\n' "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
 build_mail() {
     local subject="$1" body="$2" from="$3" to="$4"
     printf "Subject: %s\r\nFrom: %s\r\nTo: %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s" \
@@ -2920,11 +2946,36 @@ setup_mail() {
     echo -e "${GREEN}[配置邮件通知]${NC}"
     if ! command -v msmtp &>/dev/null; then
         echo "正在安装 msmtp..."
-        if command -v apt &>/dev/null; then apt update -y && apt install -y msmtp msmtp-mta
-        elif command -v dnf &>/dev/null; then dnf install -y msmtp
-        elif command -v yum &>/dev/null; then yum install -y msmtp
-        else echo -e "${RED}请手动安装 msmtp${NC}"; return 1
+        if command -v apt &>/dev/null; then
+            apt update -y >/dev/null 2>&1 || true
+            if ! apt install -y --no-install-recommends msmtp msmtp-mta ca-certificates; then
+                echo -e "${RED}✗ msmtp 安装失败，请检查软件源后重试${NC}"
+                return 1
+            fi
+        elif command -v dnf &>/dev/null; then
+            if ! dnf install -y msmtp ca-certificates; then
+                echo -e "${RED}✗ msmtp 安装失败，请检查软件源后重试${NC}"
+                return 1
+            fi
+        elif command -v yum &>/dev/null; then
+            if ! yum install -y msmtp ca-certificates; then
+                echo -e "${RED}✗ msmtp 安装失败，请检查软件源后重试${NC}"
+                return 1
+            fi
+        else
+            echo -e "${RED}请手动安装 msmtp${NC}"
+            return 1
         fi
+    fi
+    if ! command -v msmtp &>/dev/null; then
+        echo -e "${RED}✗ msmtp 安装失败，请先手动安装 msmtp 后重试${NC}"
+        return 1
+    fi
+
+    local TLS_TRUST_FILE
+    if ! TLS_TRUST_FILE=$(detect_tls_trust_file); then
+        echo -e "${RED}✗ 未找到系统 CA bundle，请先安装 ca-certificates${NC}"
+        return 1
     fi
 
     echo -e "${CYAN}支持 Gmail / QQ邮箱 / 163 等${NC}"
@@ -2948,6 +2999,10 @@ setup_mail() {
     if ! [[ "$SMTP_PORT" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}✗ SMTP 端口必须是纯数字${NC}"; return 1
     fi
+    SMTP_PORT=$((10#$SMTP_PORT))
+    if [ "$SMTP_PORT" -lt 1 ] || [ "$SMTP_PORT" -gt 65535 ]; then
+        echo -e "${RED}✗ SMTP 端口必须在 1-65535 范围内${NC}"; return 1
+    fi
     # 邮箱地址采用保守字符集，避免写入监控配置后出现 shell 元字符风险
     if ! validate_email_addr "$MAIL_FROM"; then
         echo -e "${RED}✗ 发件邮箱格式可疑: $MAIL_FROM${NC}"; return 1
@@ -2956,9 +3011,11 @@ setup_mail() {
         echo -e "${RED}✗ 收件邮箱格式可疑: $MAIL_TO${NC}"; return 1
     fi
 
+    echo -e "${YELLOW}提醒：SMTP 密码/授权码会明文写入 /root/.msmtprc（权限 600）。${NC}"
+
     # 用 Python 安全写入 .msmtprc，并在 Python 端再做一道控制字符防御
     SMTP_HOST="$SMTP_HOST" SMTP_PORT="$SMTP_PORT" \
-    MAIL_FROM="$MAIL_FROM" MAIL_PASS="$MAIL_PASS" \
+    MAIL_FROM="$MAIL_FROM" MAIL_PASS="$MAIL_PASS" TLS_TRUST_FILE="$TLS_TRUST_FILE" \
     python3 << 'PYEOF' || { echo -e "${RED}✗ msmtprc 写入失败${NC}"; return 1; }
 import os, sys, re
 
@@ -2973,6 +3030,7 @@ host = sanitize("SMTP_HOST", os.environ["SMTP_HOST"])
 port = sanitize("SMTP_PORT", os.environ["SMTP_PORT"])
 mail_from = sanitize("MAIL_FROM", os.environ["MAIL_FROM"])
 mail_pass = sanitize("MAIL_PASS", os.environ["MAIL_PASS"])
+tls_trust_file = sanitize("TLS_TRUST_FILE", os.environ["TLS_TRUST_FILE"])
 
 # msmtprc 不支持值带引号；如果密码或字段含空格/# 等，msmtp 解析时会出现非预期行为。
 # 实测 msmtp 对 password 字段是按"行尾前所有内容"读取，空格会被保留为密码一部分；
@@ -2990,7 +3048,7 @@ content = f"""defaults
 auth           on
 tls            on
 tls_starttls   {tls_starttls}
-tls_trust_file /etc/ssl/certs/ca-certificates.crt
+tls_trust_file {tls_trust_file}
 
 account        alert
 host           {host}

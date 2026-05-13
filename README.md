@@ -33,6 +33,17 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.7 关键改动
+
+- 修复回滚后 `config.json` 从备份恢复为 `600 root:root`，导致非 root Xray 无法读取配置的问题
+- `systemctl restart xray` 直接返回非零时仍会继续进入回滚流程，不再被 `set -e` 提前打断
+- 监控邮件的 `tls_trust_file` 会自动探测 Debian/RHEL/Fedora 常见 CA bundle 路径
+- SMTP 端口会去掉前导零并校验 `1-65535` 范围，`0465` 会按 `465` 正确生成 `tls_starttls off`
+- msmtp 安装失败会立即中止配置流程，并明确提示 SMTP 密码/授权码会明文保存在 `/root/.msmtprc`（权限 `600`）
+- 新增回滚权限恢复和跨发行版 CA bundle 回归测试
+
+---
+
 ## 🆕 v2.2.6 关键改动
 
 - `config.json` 改为 `root:<Xray 服务用户主组>` + `640`，避免本地非服务用户读取 UUID/REALITY 私钥
@@ -322,7 +333,7 @@ flowchart LR
 | `/root/.xray_monitor.sh` | 监控巡检脚本 |
 | `/var/log/xray/` | Xray 运行日志 |
 
-`/usr/local/etc/xray/config.json` 由脚本写入后会强制设置为 `644 root:root`。这是因为 Xray service 默认以 `nobody` 用户运行，若配置文件是 `root:root 600`，nobody 用户会因 `permission denied` 无法读取而启动失败。父目录 `/usr/local/etc/xray/` 默认权限为 `755`，只有 root 能进入，因此即便文件本身是 `644` 也不会泄露给非特权本地用户。
+`/usr/local/etc/xray/config.json` 由脚本写入或回滚后会强制设置为 `640 root:<Xray 服务用户主组>`。这样可以避免 `600 root:root` 导致非 root Xray 服务用户读取失败，也避免 `644` 让本地非服务用户读取 UUID/REALITY 私钥。
 
 > 说明：脚本会在 Xray inbound 内写入 `_remark` 字段作为节点名称元数据。当前 Xray 会忽略未知字段；该字段只供脚本在修改端口、删除节点、重建 `/root/xray_nodes_info.txt` 时恢复节点备注使用。
 
@@ -337,7 +348,7 @@ flowchart LR
 - 写入 `/etc/sysctl.d/99-xray.conf` 开启 BBR 与网络参数优化
 - 如果系统没有 swap 且不存在 `/swapfile`，会创建 1G swap
 - 修改系统防火墙规则，并尽量持久化到对应后端
-- 配置监控报警时会写入 `/root/.msmtprc` 与 `/root/.xray_monitor.conf`，权限为 `600`
+- 配置监控报警时会写入 `/root/.msmtprc` 与 `/root/.xray_monitor.conf`，权限为 `600`；SMTP 密码/授权码会以明文保存在 `/root/.msmtprc`
 - 启用监控时会写入 `xray-monitor.service` / `xray-monitor.timer`，timer 每分钟运行一次
 
 ---
