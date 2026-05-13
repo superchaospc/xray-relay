@@ -3,6 +3,11 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.5 修复点：
+#    - 修复删除节点时 socks5-out-1 误匹配 socks5-out-10 的孤儿 outbound 问题
+#    - nftables 改用 JSON 解析端口规则，避免端口范围被误判为已放行
+#    - get_ip 在 stdin EOF 时向调用方返回失败，避免空 VPS_IP 继续生成链接
+#
 #  v2.2.1 修复点：
 #    - 所有节点变更路径都会同步刷新订阅文件
 #    - 补充订阅文件生成测试，并在卸载时清理订阅文件
@@ -87,7 +92,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.4     ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.5     ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -132,7 +137,15 @@ get_ip() {
          curl -s4 --max-time 5 icanhazip.com 2>/dev/null || true)
     if [ -z "$IP" ]; then
         echo -e "${RED}无法获取本机公网 IP，请手动输入:${NC}" >&2
-        prompt_read IP -rp "VPS 公网 IP: "
+        if ! read -rp "VPS 公网 IP: " IP; then
+            echo "" >&2
+            echo -e "${YELLOW}输入流已结束，无法获取 VPS 公网 IP。${NC}" >&2
+            return 1
+        fi
+    fi
+    if [ -z "$IP" ]; then
+        echo -e "${RED}VPS 公网 IP 不能为空${NC}" >&2
+        return 1
     fi
 
     echo "$IP" > "$IP_CACHE_FILE" 2>/dev/null || true
@@ -569,6 +582,80 @@ persist_nftables_rules() {
     return 0
 }
 
+nft_tcp_dport_accept_handles() {
+    local family="$1" table="$2" chain="$3" port="$4" include_sets="${5:-0}"
+    local nft_json_file rc
+    nft_json_file=$(mktemp /tmp/.xray-nft-chain.XXXXXX.json) || return 1
+    if ! nft -j -a list chain "$family" "$table" "$chain" > "$nft_json_file" 2>/dev/null; then
+        rm -f "$nft_json_file"
+        return 1
+    fi
+
+    NFT_JSON_FILE="$nft_json_file" NFT_PORT="$port" NFT_INCLUDE_SETS="$include_sets" python3 << 'PYEOF'
+import json
+import os
+import sys
+
+try:
+    with open(os.environ["NFT_JSON_FILE"]) as f:
+        doc = json.load(f)
+    port = int(os.environ["NFT_PORT"])
+except Exception:
+    sys.exit(1)
+
+include_sets = os.environ.get("NFT_INCLUDE_SETS") == "1"
+
+def scalar_port(value):
+    try:
+        return int(value) == port
+    except (TypeError, ValueError):
+        return False
+
+def right_matches(value):
+    if scalar_port(value):
+        return True
+    if isinstance(value, dict):
+        if "range" in value:
+            return False
+        if include_sets and "set" in value:
+            return any(right_matches(item) for item in value.get("set", []))
+    if include_sets and isinstance(value, list):
+        return any(right_matches(item) for item in value)
+    return False
+
+def is_tcp_dport_match(expr):
+    match = expr.get("match") if isinstance(expr, dict) else None
+    if not isinstance(match, dict):
+        return False
+    left = match.get("left", {})
+    payload = left.get("payload", {}) if isinstance(left, dict) else {}
+    return (
+        isinstance(payload, dict)
+        and payload.get("protocol") == "tcp"
+        and payload.get("field") == "dport"
+        and right_matches(match.get("right"))
+    )
+
+handles = []
+for item in doc.get("nftables", []):
+    rule = item.get("rule") if isinstance(item, dict) else None
+    if not isinstance(rule, dict):
+        continue
+    exprs = rule.get("expr", [])
+    has_accept = any(isinstance(expr, dict) and "accept" in expr for expr in exprs)
+    has_port = any(is_tcp_dport_match(expr) for expr in exprs)
+    if has_accept and has_port and rule.get("handle") is not None:
+        handles.append(str(rule["handle"]))
+
+if not handles:
+    sys.exit(1)
+print("\n".join(handles))
+PYEOF
+    rc=$?
+    rm -f "$nft_json_file"
+    return "$rc"
+}
+
 nft_input_chains() {
     nft list ruleset 2>/dev/null | awk '
         /^table[ \t]+/ {
@@ -643,8 +730,7 @@ apply_firewall_port() {
             nft_seen_input=1
             policy="${policy:-accept}"
 
-            chain_rules=$(nft list chain "$family" "$table" "$chain" 2>/dev/null || true)
-            if echo "$chain_rules" | grep -qE "tcp dport .*\b${port}\b.* accept"; then
+            if nft_tcp_dport_accept_handles "$family" "$table" "$chain" "$port" 1 >/dev/null; then
                 echo -e "  ${GREEN}✓ nftables 已存在 ${port}/tcp 放行规则: ${family} ${table} ${chain}${NC}"
                 continue
             fi
@@ -764,10 +850,7 @@ revoke_firewall_port() {
                 else
                     nft_failed=1
                 fi
-            done < <(
-                nft -a list chain "$family" "$table" "$chain" 2>/dev/null \
-                    | grep -E "tcp dport .*\b${port}\b.* accept.* # handle " || true
-            )
+            done < <(nft_tcp_dport_accept_handles "$family" "$table" "$chain" "$port" 0 || true)
         done < <(nft_input_chains)
 
         if [ "$nft_failed" -ne 0 ]; then
@@ -873,26 +956,26 @@ update_system() {
 
     if command -v apt &>/dev/null; then
         export DEBIAN_FRONTEND=noninteractive
-        apt update -y
-        apt install -y curl python3 iproute2 ca-certificates qrencode
+        apt update -y || true
+        apt install -y curl python3 iproute2 ca-certificates qrencode || true
         if [ "${XRAY_FULL_UPGRADE:-0}" = "1" ]; then
             echo -e "  ${YELLOW}XRAY_FULL_UPGRADE=1，执行完整系统升级...${NC}"
-            apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-            apt autoremove -y
+            apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" || true
+            apt autoremove -y || true
         else
             echo -e "  ${CYAN}ℹ 仅安装依赖（如需整机升级请用 XRAY_FULL_UPGRADE=1 重跑）${NC}"
         fi
         echo -e "  ${GREEN}✓ 依赖已就绪 (apt)${NC}"
     elif command -v dnf &>/dev/null; then
-        dnf install -y curl python3 iproute ca-certificates qrencode
+        dnf install -y curl python3 iproute ca-certificates qrencode || true
         if [ "${XRAY_FULL_UPGRADE:-0}" = "1" ]; then
-            dnf update -y
+            dnf update -y || true
         fi
         echo -e "  ${GREEN}✓ 依赖已就绪 (dnf)${NC}"
     elif command -v yum &>/dev/null; then
-        yum install -y curl python3 iproute ca-certificates qrencode
+        yum install -y curl python3 iproute ca-certificates qrencode || true
         if [ "${XRAY_FULL_UPGRADE:-0}" = "1" ]; then
-            yum update -y
+            yum update -y || true
         fi
         echo -e "  ${GREEN}✓ 依赖已就绪 (yum)${NC}"
     else
@@ -1026,7 +1109,7 @@ generate_config() {
         return 1
     fi
 
-    NEW_CONFIG_FILE="$NEW_CONFIG" \
+    if ! NEW_CONFIG_FILE="$NEW_CONFIG" \
     UUID="$UUID" \
     PRIVATE_KEY="$PRIVATE_KEY" \
     SHORT_ID="$SHORT_ID" \
@@ -1088,6 +1171,11 @@ with open(new_config,"w") as f:
     json.dump(config, f, indent=4)
 os.chmod(new_config, 0o600)
 PYEOF
+    then
+        echo -e "${RED}配置生成失败，已清理临时文件${NC}"
+        rm -f "$NEW_CONFIG"
+        return 1
+    fi
 
     if ! validate_and_install_config "$NEW_CONFIG"; then
         echo -e "${RED}配置生成失败，部署终止${NC}"
@@ -1183,7 +1271,9 @@ start_service() {
 }
 
 print_result() {
-    VPS_IP=$(get_ip)
+    if ! VPS_IP=$(get_ip); then
+        return 1
+    fi
     local LINK_HOST
     LINK_HOST=$(format_vless_host "$VPS_IP")
     echo ""
@@ -1264,7 +1354,9 @@ PYEOF
     fi
 
     local VPS_IP PUBLIC_KEY
-    VPS_IP=$(get_ip)
+    if ! VPS_IP=$(get_ip); then
+        return 1
+    fi
     load_node_identity
     if [ -z "$UUID" ] || [ -z "$PRIVATE_KEY" ] || [ -z "$SHORT_ID" ]; then
         echo -e "${YELLOW}⚠ 无法从现有配置读取节点身份，跳过刷新 ${INFO_FILE}${NC}"
@@ -1456,7 +1548,9 @@ add_batch_nodes() {
     echo -e "${CYAN}线路名称会自动使用 host/IP。${NC}"
     echo ""
 
-    VPS_IP=$(get_ip)
+    if ! VPS_IP=$(get_ip); then
+        return 1
+    fi
 
     if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "${RED}未找到现有配置，请先完整安装！${NC}"
@@ -1571,7 +1665,7 @@ for node in raw_nodes:
     try:
         s_port = int(s_port)
     except ValueError:
-        print("S_PORT 非数字")
+        print("S_PORT 非数字", file=sys.stderr)
         sys.exit(2)
 
     config.setdefault("inbounds", []).append({
@@ -1638,7 +1732,9 @@ PYEOF
 # ========== 添加节点（住宅 SOCKS5）==========
 add_node() {
     echo -e "${GREEN}[添加节点模式]${NC}"
-    VPS_IP=$(get_ip)
+    if ! VPS_IP=$(get_ip); then
+        return 1
+    fi
 
     if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "${RED}未找到现有配置，请先完整安装！${NC}"
@@ -1703,7 +1799,7 @@ s_host = os.environ["S_HOST"]
 try:
     s_port = int(os.environ["S_PORT"])
 except ValueError:
-    print("S_PORT 非数字"); sys.exit(2)
+    print("S_PORT 非数字", file=sys.stderr); sys.exit(2)
 s_user = os.environ["S_USER"]
 s_pass = os.environ["S_PASS"]
 
@@ -1776,7 +1872,9 @@ PYEOF
 add_direct_node() {
     echo -e "${GREEN}[添加 VPS 直连节点]${NC}"
     echo -e "${CYAN}流量直接从 VPS 出口，目标看到的是机房 IP。${NC}"
-    VPS_IP=$(get_ip)
+    if ! VPS_IP=$(get_ip); then
+        return 1
+    fi
 
     if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "${RED}未找到现有配置，请先完成【全新安装】！${NC}"; return
@@ -2328,7 +2426,9 @@ PYEOF
             revoke_firewall_port_capture "$OLD_PORT"
             echo -e "  $(format_fw_revoke_status)"
         fi
-        VPS_IP=$(get_ip)
+        if ! VPS_IP=$(get_ip); then
+            return 1
+        fi
         load_node_identity
         PUBLIC_KEY=$(derive_public_key "$PRIVATE_KEY") || return
         NODE_NAME=$(CONFIG_FILE="$CONFIG_FILE" NEW_PORT="$NEW_PORT" python3 - << 'PYEOF'
@@ -2449,7 +2549,7 @@ config["routing"]["rules"] = new_rules
 
 if out_tag and out_tag not in ("direct","block"):
     # 仅当没有其他规则引用此 outbound 时才删除（防止共享 outbound 被误删）
-    still_used = any(out_tag in (r.get("outboundTag") or "") for r in config["routing"]["rules"])
+    still_used = any(r.get("outboundTag") == out_tag for r in config["routing"]["rules"])
     if not still_used:
         config["outbounds"] = [o for o in config["outbounds"] if o.get("tag") != out_tag]
 
@@ -2666,7 +2766,8 @@ update_xray() {
         echo -e "  ${RED}Xray 未安装${NC}"; return
     fi
 
-    LATEST=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+    LATEST=$(curl -fsSL --max-time 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin).get("tag_name", ""))' 2>/dev/null || true)
     [ -n "$LATEST" ] && echo -e "  最新版本: ${YELLOW}${LATEST}${NC}" || echo -e "  ${YELLOW}无法获取最新版本号${NC}"
 
     prompt_read CONFIRM -rp "确认更新？(y/n): "
@@ -2822,6 +2923,7 @@ log() { echo "[$NOW] $1" >> "$MONITOR_LOG"; }
 
 send_alert() {
     local SUBJECT="$1" BODY="$2"
+    find /tmp -maxdepth 1 -name '.xray_alert_lock_*' -mmin +60 -delete 2>/dev/null || true
     local LOCK_KEY
     LOCK_KEY=$(printf "%s" "$BODY" | sed -E 's/[0-9]+/N/g' | md5sum | cut -d' ' -f1)
     local LOCK_FILE="${ALERT_LOCK}_${LOCK_KEY}"
@@ -2993,7 +3095,9 @@ monitor_menu() {
         e)
             if [ -f "$MONITOR_CONF" ]; then
                 source "$MONITOR_CONF"
-                VPS_IP=$(get_ip)
+                if ! VPS_IP=$(get_ip); then
+                    return 1
+                fi
                 TB="测试邮件
 服务器: ${VPS_IP}
 时间: $(date)"

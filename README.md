@@ -33,6 +33,19 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.5 关键改动
+
+- 修复删除节点时 `socks5-out-1` 会误匹配 `socks5-out-10` 的问题，避免产生孤儿 outbound
+- nftables 端口规则检测改用 `nft -j -a` JSON 解析，避免 `tcp dport 80-90 accept` 被误判为某个单端口已放行
+- nftables 旧端口回收同样使用精确解析，避免误删端口集合或端口范围规则
+- `update_system` 对临时软件源抖动更宽容，依赖安装失败不会立刻打断脚本；仍会硬校验必需的 `python3`
+- `update_xray` 查询 GitHub 最新版本增加 10 秒超时，并改用 JSON 解析 `tag_name`
+- `generate_config` 生成失败时会清理临时配置文件
+- `get_ip` 在自动获取失败且 stdin EOF 时会返回失败，调用方不再带着空 `VPS_IP` 继续生成链接
+- 新增删除节点 outbound 精确匹配、`get_ip` EOF、nftables 端口范围误判回归测试
+
+---
+
 ## 🆕 v2.2.4 关键改动
 
 - 所有面向用户的交互提示在 stdin EOF 时都会优雅取消并退出 0，避免非交互管道触发 `set -e` 退出 1
