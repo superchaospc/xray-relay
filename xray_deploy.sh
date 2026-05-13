@@ -3,6 +3,11 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.9 修复点：
+#    - 修复 nftables 回收端口时 handle 提取不匹配，导致旧端口规则残留的问题
+#    - nftables 新增规则写入 xray-relay-managed comment，回收时优先只删除脚本管理的规则
+#    - 卸载时遍历现有配置端口并尝试回收脚本放行的防火墙规则
+#
 #  v2.2.8 修复点：
 #    - SMTP 密码明文保存提醒前移到密码输入之前
 #    - config.json 权限设置失败时显式报错并中止安装/回滚流程
@@ -80,6 +85,7 @@ IP_CACHE_FILE="/root/.xray_vps_ip"
 IP_CACHE_TTL="${IP_CACHE_TTL:-3600}"
 # nftables 持久化配置文件。默认不会覆盖既有文件，除非设置 XRAY_NFTABLES_OVERWRITE=1。
 NFTABLES_CONF="${NFTABLES_CONF:-/etc/nftables.conf}"
+NFT_MANAGED_COMMENT="${NFT_MANAGED_COMMENT:-xray-relay-managed}"
 # 客户端指纹（chrome / firefox / safari / ios / android / edge / random）
 CLIENT_FP="${CLIENT_FP:-chrome}"
 # REALITY 伪装目标，可用环境变量覆盖：
@@ -109,7 +115,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.8     ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.9     ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -660,7 +666,7 @@ persist_nftables_rules() {
 }
 
 nft_tcp_dport_accept_handles() {
-    local family="$1" table="$2" chain="$3" port="$4" include_sets="${5:-0}"
+    local family="$1" table="$2" chain="$3" port="$4" include_sets="${5:-0}" comment_filter="${6:-any}"
     local nft_json_file rc
     nft_json_file=$(mktemp /tmp/.xray-nft-chain.XXXXXX.json) || return 1
     if ! nft -j -a list chain "$family" "$table" "$chain" > "$nft_json_file" 2>/dev/null; then
@@ -668,7 +674,8 @@ nft_tcp_dport_accept_handles() {
         return 1
     fi
 
-    NFT_JSON_FILE="$nft_json_file" NFT_PORT="$port" NFT_INCLUDE_SETS="$include_sets" python3 << 'PYEOF'
+    NFT_JSON_FILE="$nft_json_file" NFT_PORT="$port" NFT_INCLUDE_SETS="$include_sets" \
+    NFT_COMMENT_FILTER="$comment_filter" NFT_MANAGED_COMMENT="$NFT_MANAGED_COMMENT" python3 << 'PYEOF'
 import json
 import os
 import sys
@@ -681,6 +688,8 @@ except Exception:
     sys.exit(1)
 
 include_sets = os.environ.get("NFT_INCLUDE_SETS") == "1"
+comment_filter = os.environ.get("NFT_COMMENT_FILTER", "any")
+managed_comment = os.environ.get("NFT_MANAGED_COMMENT", "xray-relay-managed")
 
 def scalar_port(value):
     try:
@@ -713,6 +722,14 @@ def is_tcp_dport_match(expr):
         and right_matches(match.get("right"))
     )
 
+def has_managed_comment(rule, exprs):
+    if rule.get("comment") == managed_comment:
+        return True
+    for expr in exprs:
+        if isinstance(expr, dict) and expr.get("comment") == managed_comment:
+            return True
+    return False
+
 handles = []
 for item in doc.get("nftables", []):
     rule = item.get("rule") if isinstance(item, dict) else None
@@ -721,6 +738,11 @@ for item in doc.get("nftables", []):
     exprs = rule.get("expr", [])
     has_accept = any(isinstance(expr, dict) and "accept" in expr for expr in exprs)
     has_port = any(is_tcp_dport_match(expr) for expr in exprs)
+    is_managed = has_managed_comment(rule, exprs)
+    if comment_filter == "managed" and not is_managed:
+        continue
+    if comment_filter == "legacy" and is_managed:
+        continue
     if has_accept and has_port and rule.get("handle") is not None:
         handles.append(str(rule["handle"]))
 
@@ -813,7 +835,7 @@ apply_firewall_port() {
             fi
 
             if [ "$policy" = "drop" ] || [ "$policy" = "reject" ]; then
-                if nft insert rule "$family" "$table" "$chain" tcp dport "$port" accept 2>/dev/null; then
+                if nft insert rule "$family" "$table" "$chain" tcp dport "$port" accept comment "$NFT_MANAGED_COMMENT" 2>/dev/null; then
                     nft_changed=1
                     echo -e "  ${GREEN}✓ 已通过 nftables 放行 ${port}/tcp: ${family} ${table} ${chain}${NC}"
                 else
@@ -894,6 +916,7 @@ apply_firewall_port() {
 # 云厂商安全组无法自动回收，且防火墙规则可能并非本脚本创建，因此失败只提示不阻断主流程。
 revoke_firewall_port() {
     local port="$1"
+    local legacy_mode="${2:-include-legacy}"
 
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw --force delete allow "${port}/tcp" >/dev/null 2>&1 || \
@@ -919,21 +942,42 @@ revoke_firewall_port() {
     fi
 
     if command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q "^table"; then
-        local nft_seen_input=0 nft_changed=0 nft_failed=0
-        local family table chain policy line handle
+        local nft_seen_input=0 nft_changed=0 nft_failed=0 nft_managed_found=0
+        local family table chain policy handle chains_file
+        chains_file=$(mktemp /tmp/.xray-nft-input-chains.XXXXXX) || return 3
+        nft_input_chains > "$chains_file" || true
+
         while IFS=$'\t' read -r family table chain policy; do
             [ -n "${family:-}" ] && [ -n "${table:-}" ] && [ -n "${chain:-}" ] || continue
             nft_seen_input=1
-            while IFS= read -r line; do
-                handle=$(printf '%s\n' "$line" | sed -n 's/.* # handle \([0-9][0-9]*\)$/\1/p')
-                [ -n "$handle" ] || continue
+            while IFS= read -r handle; do
+                [[ "$handle" =~ ^[0-9]+$ ]] || continue
+                nft_managed_found=1
                 if nft delete rule "$family" "$table" "$chain" handle "$handle" 2>/dev/null; then
                     nft_changed=1
                 else
                     nft_failed=1
                 fi
-            done < <(nft_tcp_dport_accept_handles "$family" "$table" "$chain" "$port" 0 || true)
-        done < <(nft_input_chains)
+            done < <(nft_tcp_dport_accept_handles "$family" "$table" "$chain" "$port" 0 managed || true)
+        done < "$chains_file"
+
+        # 兼容 v2.2.8 及更早版本创建的未带 comment 的精确端口规则。
+        # 如果已经发现 managed 规则，则不碰同端口的 legacy 规则，避免误删用户规则。
+        if [ "$legacy_mode" != "managed-only" ] && [ "$nft_managed_found" -eq 0 ] && [ "$nft_failed" -eq 0 ]; then
+            while IFS=$'\t' read -r family table chain policy; do
+                [ -n "${family:-}" ] && [ -n "${table:-}" ] && [ -n "${chain:-}" ] || continue
+                nft_seen_input=1
+                while IFS= read -r handle; do
+                    [[ "$handle" =~ ^[0-9]+$ ]] || continue
+                    if nft delete rule "$family" "$table" "$chain" handle "$handle" 2>/dev/null; then
+                        nft_changed=1
+                    else
+                        nft_failed=1
+                    fi
+                done < <(nft_tcp_dport_accept_handles "$family" "$table" "$chain" "$port" 0 legacy || true)
+            done < "$chains_file"
+        fi
+        rm -f "$chains_file"
 
         if [ "$nft_failed" -ne 0 ]; then
             echo -e "  ${YELLOW}⚠ nftables 回收 ${port}/tcp 失败，请按需手动清理${NC}"
@@ -2823,6 +2867,37 @@ remove_traffic_cron() {
     rm -f "$tmp_cron"
 }
 
+cleanup_firewall_ports_from_config() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    local ports port
+    ports=$(CONFIG_FILE="$CONFIG_FILE" python3 <<'PYEOF' 2>/dev/null || true
+import json
+import os
+
+with open(os.environ["CONFIG_FILE"]) as f:
+    config = json.load(f)
+
+seen = set()
+for inb in config.get("inbounds", []):
+    if inb.get("tag") == "api-in":
+        continue
+    try:
+        port = int(inb.get("port"))
+    except (TypeError, ValueError):
+        continue
+    if 1 <= port <= 65535 and port not in seen:
+        seen.add(port)
+        print(port)
+PYEOF
+)
+    [ -n "$ports" ] || return 0
+    echo -e "${CYAN}ℹ 正在尝试回收脚本管理的防火墙端口...${NC}"
+    while IFS= read -r port; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        revoke_firewall_port "$port" managed-only || true
+    done <<< "$ports"
+}
+
 uninstall() {
     prompt_read CONFIRM -rp "确认卸载 Xray？(y/n): "
     if [ "$CONFIRM" = "y" ]; then
@@ -2830,6 +2905,7 @@ uninstall() {
         systemctl disable xray 2>/dev/null || true
         systemctl stop xray-monitor.timer 2>/dev/null || true
         systemctl disable xray-monitor.timer 2>/dev/null || true
+        cleanup_firewall_ports_from_config || true
         run_xray_installer remove || echo -e "${YELLOW}⚠ 远程卸载脚本无法运行，仅清理本地${NC}"
         rm -f /etc/systemd/system/xray-monitor.service /etc/systemd/system/xray-monitor.timer
         rm -rf /etc/systemd/system/xray.service.d

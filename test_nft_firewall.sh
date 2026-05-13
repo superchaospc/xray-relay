@@ -9,6 +9,7 @@ YELLOW=""
 RED=""
 CYAN=""
 NC=""
+NFT_MANAGED_COMMENT="xray-relay-managed"
 
 eval "$(
     awk '
@@ -32,6 +33,7 @@ run_case() {
     NFT_RULESET="$ruleset"
     NFT_CHAIN_JSON="$chain_json"
     NFT_INSERTS=0
+    NFT_LAST_INSERT=""
     PERSIST_CALLED=0
 
     local rc=0 out_file
@@ -66,6 +68,7 @@ nft() {
             ;;
         insert\ rule*)
             NFT_INSERTS=$((NFT_INSERTS + 1))
+            NFT_LAST_INSERT="$*"
             ;;
         -c\ -f*)
             ;;
@@ -104,6 +107,18 @@ run_case "drop input 链会 insert 放行规则" "$DROP_RULESET" "$EMPTY_CHAIN_J
 run_case "exact dport 已放行时不重复 insert" "$DROP_RULESET" "$EXACT_443_JSON" 0 0
 run_case "set 中含端口时不重复 insert" "$DROP_RULESET" "$SET_443_JSON" 0 0
 run_case "端口范围不误判为精确放行" "$DROP_RULESET" "$RANGE_443_JSON" 0 1
+
+NFT_RULESET="$DROP_RULESET"
+NFT_CHAIN_JSON="$EMPTY_CHAIN_JSON"
+NFT_INSERTS=0
+NFT_LAST_INSERT=""
+PERSIST_CALLED=0
+apply_firewall_port 443 >/dev/null 2>&1
+if [[ "$NFT_LAST_INSERT" != *"comment xray-relay-managed"* ]]; then
+    echo "  ✗ nftables 自动插入规则未写入 managed comment: $NFT_LAST_INSERT"
+    exit 1
+fi
+echo "  ✓ 自动插入规则带 managed comment"
 
 NFT_CHAIN_JSON="$EXACT_443_JSON"
 [ "$(nft_tcp_dport_accept_handles inet filter input 443 0)" = "5" ]

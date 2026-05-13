@@ -33,6 +33,16 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.9 关键改动
+
+- 修复 nftables 回收旧端口时 handle 提取接口不匹配的问题，改端口/删节点会正确删除旧端口规则
+- nftables 新增规则会写入 `xray-relay-managed` comment，回收时优先只删除脚本管理的规则
+- 兼容清理 v2.2.8 及更早版本创建的 legacy 精确端口规则；若同端口存在 managed 规则，则不会碰 legacy 规则
+- 卸载时会从当前配置读取端口，并尝试回收带 managed comment 的脚本管理防火墙规则
+- 新增 `test_nft_firewall_revoke.sh`，覆盖 managed/legacy handle 删除、同端口防误删和端口集合防误删
+
+---
+
 ## 🆕 v2.2.8 关键改动
 
 - SMTP 密码/授权码明文保存提醒前移到密码输入之前，用户可在输入敏感信息前决定是否继续
