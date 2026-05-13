@@ -182,10 +182,13 @@ CLIENT_FP=ios REALITY_SERVER_NAME=www.apple.com REALITY_DEST=www.apple.com:443 /
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `XRAY_INSTALL_REF` | `main` | `XTLS/Xray-install` 的 ref；生产环境推荐填固定 commit SHA |
-| `XRAY_INSTALL_SHA256` | 空 | `install-release.sh` 的 sha256；设置后会强制校验 |
+| `XRAY_INSTALL_REF` | `e741a4f56d368afbb9e5be3361b40c4552d3710d` | `XTLS/Xray-install` 的 ref；默认固定 commit，需要追新可显式设为 `main` |
+| `XRAY_INSTALL_SHA256` | `7f70c95f6b418da8b4f4883343d602964915e28748993870fd554383afdbe555` | `install-release.sh` 的 sha256；设置后会强制校验，追新 `main` 时需显式置空 |
 | `XRAY_FULL_UPGRADE` | `0` | 设为 `1` 时才执行整机升级 |
 | `XRAY_REDACT` | `0` | 设为 `1` 时隐藏终端输出里的 UUID / 密钥中段 |
+| `XRAY_PRINT_SUB_DATA_URL` | `0` | 设为 `1` 时在终端打印订阅 Data URL |
+| `XRAY_NFTABLES_OVERWRITE` | `0` | 设为 `1` 时允许用当前 ruleset 覆盖既有 `NFTABLES_CONF` |
+| `NFTABLES_CONF` | `/etc/nftables.conf` | nftables 持久化配置文件路径，通常无需修改 |
 | `CLIENT_FP` | `chrome` | 客户端指纹；iOS / Shadowrocket 可考虑 `ios` 或 `safari` |
 | `REALITY_SERVER_NAME` | `www.cloudflare.com` | VLESS 链接里的 SNI |
 | `REALITY_DEST` | `${REALITY_SERVER_NAME}:443` | Xray REALITY 回源目标 |
@@ -203,11 +206,11 @@ chmod +x /root/xray_deploy.sh
 /root/xray_deploy.sh
 ```
 
-首次选择 `1) 全新安装` 或 `8) 更新 Xray` 时，脚本会默认使用 Xray 官方安装脚本的 `main` 分支，因此新 VPS 可以直接安装。运行时会提示当前使用的是追新模式；生产环境建议改用下面的固定 commit 方式。
+首次选择 `1) 全新安装` 或 `8) 更新 Xray` 时，脚本默认使用已固定的 Xray 官方安装脚本 commit，并校验 `install-release.sh` 的 sha256，降低上游脚本变化带来的供应链风险。
 
 ### 生产安全模式
 
-先固定 `XTLS/Xray-install` 的 commit，并可选写入 sha256：
+默认已经采用固定 commit + sha256。需要升级固定版本时，可先查询 `XTLS/Xray-install` 的新 commit，并计算对应 sha256：
 
 ```bash
 git ls-remote https://github.com/XTLS/Xray-install.git refs/heads/main
@@ -215,7 +218,7 @@ git ls-remote https://github.com/XTLS/Xray-install.git refs/heads/main
 curl -L https://raw.githubusercontent.com/XTLS/Xray-install/<COMMIT>/install-release.sh | sha256sum
 ```
 
-然后编辑脚本顶部：
+然后编辑脚本顶部，替换默认值：
 
 ```bash
 XRAY_INSTALL_REF_DEFAULT="<COMMIT>"
@@ -224,10 +227,10 @@ XRAY_INSTALL_SHA256_DEFAULT="<sha256>"
 
 ### 显式追新模式
 
-默认已经跟随官方安装脚本 `main` 分支。如果你想在命令里显式写出来，也可以：
+如需主动跟随官方安装脚本 `main` 分支，可在运行时显式覆盖 ref，并把 sha256 校验置空：
 
 ```bash
-XRAY_INSTALL_REF=main /root/xray_deploy.sh
+XRAY_INSTALL_REF=main XRAY_INSTALL_SHA256= /root/xray_deploy.sh
 ```
 
 也可以一行运行远端脚本：
@@ -235,7 +238,7 @@ XRAY_INSTALL_REF=main /root/xray_deploy.sh
 ```bash
 curl -fsSL https://raw.githubusercontent.com/superchaospc/xray-relay/main/xray_deploy.sh -o /tmp/xray_deploy.sh \
   && chmod +x /tmp/xray_deploy.sh \
-  && XRAY_INSTALL_REF=main /tmp/xray_deploy.sh
+  && XRAY_INSTALL_REF=main XRAY_INSTALL_SHA256= /tmp/xray_deploy.sh
 ```
 
 ### 🛠️ 首次部署 VPS 直连
@@ -345,11 +348,15 @@ flowchart LR
 | --- | --- |
 | `/usr/local/etc/xray/config.json` | Xray 主配置 |
 | `/root/xray_nodes_info.txt` | 所有节点的 VLESS 链接备份 |
+| `/root/xray_subscription.txt` | base64 订阅内容 |
 | `/root/.xray_vps_ip` | VPS 公网 IP 缓存 |
+| `/root/.xray_traffic_db` | 流量统计数据库 |
+| `/root/.xray_traffic_record.sh` | 流量采集脚本（cron 每 5 分钟运行一次） |
 | `/etc/sysctl.d/99-xray.conf` | BBR 与内核调优参数 |
 | `/etc/systemd/system/xray.service.d/limits.conf` | Xray 文件描述符上限配置 |
 | `/root/.xray_monitor.conf` | 监控告警配置（如启用） |
 | `/root/.xray_monitor.sh` | 监控巡检脚本 |
+| `/root/.msmtprc` | msmtp 邮件发送配置（如启用监控邮件） |
 | `/var/log/xray/` | Xray 运行日志 |
 
 `/usr/local/etc/xray/config.json` 由脚本写入或回滚后会强制设置为 `640 root:<Xray 服务用户主组>`。这样可以避免 `600 root:root` 导致非 root Xray 服务用户读取失败，也避免 `644` 让本地非服务用户读取 UUID/REALITY 私钥。
@@ -384,22 +391,29 @@ bash run_all_tests.sh
 
 - `bash -n xray_deploy.sh`
 - `shellcheck -S error xray_deploy.sh`（未安装则跳过）
-- SOCKS5 输入解析，包括 URL 端口非法、IPv6、密码特殊字符
-- 入站端口计算，包括端口耗尽时返回非 0
-- public key 派生失败、业务端口过滤与端口修改链接备注
-- 配置原子写入与回滚流程
-- 节点信息解析
-- SMTP 输入校验
-- 防火墙返回码捕获链路
-- nftables input 链识别，包括 fail2ban 默认 accept 链与默认 drop 链
-- 流量统计首次记录 delta=0
-- 监控告警按故障详情去重
-- 节点备注写入配置并可恢复
+- `test_parser.py`：SOCKS5 输入解析，包括 URL 端口非法、IPv6、密码特殊字符
+- `test_prompt_read_eof.sh`：交互提示在 stdin EOF 时优雅退出
+- `test_get_ip_eof.sh`：公网 IP 获取在 EOF 场景下返回失败
+- `test_next_port.sh`：入站端口计算，包括端口耗尽时返回非 0
+- `test_public_key_and_ports.sh`：public key 派生失败、业务端口过滤与端口修改链接备注
+- `test_atomic_config.sh`：配置原子写入与回滚流程
+- `test_restart_rollback_permissions.sh`：重启失败回滚后恢复 `config.json` 权限
+- `test_info_parse.sh`：节点信息解析
+- `test_subscription_file.sh`：订阅文件生成与刷新
+- `test_smtp_validate.sh`：SMTP 输入校验
+- `test_firewall_capture.sh`：防火墙返回码捕获链路
+- `test_nft_firewall.sh`：nftables input 链识别，包括 fail2ban 默认 accept 链与默认 drop 链
+- `test_nft_firewall_revoke.sh`：nftables managed/legacy 端口规则回收与防误删
+- `test_crontab_cleanup.sh`：卸载时清理流量统计 cron
+- `test_delete_node_outbound_match.sh`：删除节点时 outbound 精确匹配
+- `test_traffic_record.sh`：流量统计首次记录 delta=0
+- `test_monitor_alert.sh`：监控告警按故障详情去重
+- `test_config_remarks.sh`：节点备注写入配置并可恢复
 
 当前测试结果：
 
 ```text
-通过: 13  失败: 0  跳过: 0
+通过: 20  失败: 0  跳过: 0
 ```
 
 如果系统未安装 `shellcheck`，静态检查会自动跳过该项。
@@ -410,10 +424,10 @@ bash run_all_tests.sh
 
 **Q: 脚本提示 `Xray 安装脚本来源未配置`，是不是坏了？**
 
-A: 通常是你手动把脚本里的安装来源改成了空值。当前脚本默认 `XRAY_INSTALL_REF_DEFAULT="main"`，新 VPS 可直接安装。生产环境建议固定 `XTLS/Xray-install` 的 commit 和 sha256；也可以显式使用：
+A: 通常是你手动把脚本里的安装来源改成了空值。当前脚本默认固定 `XTLS/Xray-install` 的 commit 并校验 sha256，新 VPS 可直接安装。如需主动追新，也可以显式使用：
 
 ```bash
-XRAY_INSTALL_REF=main /root/xray_deploy.sh
+XRAY_INSTALL_REF=main XRAY_INSTALL_SHA256= /root/xray_deploy.sh
 ```
 
 **Q: 部署后客户端连不上？**
@@ -476,7 +490,7 @@ A: 新版 Xray 对配置文件格式识别更严格，临时配置文件需要 `
 
 **Q: 启动失败并提示 `permission denied` 读取 `config.json`？**
 
-A: 这通常是 Xray service 以 `nobody` 等非 root 用户运行，但配置文件被写成了 `root:root 600`。当前脚本会强制把新写入的 `config.json` 设为 `644 root:root`，确保 nobody 可读。父目录 `/usr/local/etc/xray/` 默认权限 `755` 只有 root 能进入，所以 `644` 不会泄露给非特权本地用户。
+A: 这通常是 Xray service 以 `nobody` 等非 root 用户运行，但配置文件被写成了 `root:root 600`。当前脚本会强制把新写入或回滚恢复的 `config.json` 设为 `640 root:<Xray 服务用户主组>`，确保 Xray 服务用户可读，同时避免本地其他用户读取 UUID/REALITY 私钥。
 
 历史教训：早期版本曾尝试「继承现有文件 owner/group」，但一旦初始文件意外是 `600 root:root`（比如 root umask 077 下用 Python `open('w')` 写出来的），后续每次写新配置都会延续这个错误，nobody 永远读不到。详见 [commit f28238c](https://github.com/superchaospc/xray-relay/commit/f28238c)。
 
