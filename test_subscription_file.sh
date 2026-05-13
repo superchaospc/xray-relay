@@ -46,7 +46,7 @@ if [ "$decoded" != "$expected" ]; then
     exit 1
 fi
 
-if [ "$(stat -f '%Lp' "$SUB_FILE" 2>/dev/null || stat -c '%a' "$SUB_FILE")" != "600" ]; then
+if [ "$(stat -c '%a' "$SUB_FILE" 2>/dev/null || stat -f '%Lp' "$SUB_FILE")" != "600" ]; then
     echo "订阅文件权限不是 600"
     exit 1
 fi
