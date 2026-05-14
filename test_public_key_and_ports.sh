@@ -8,9 +8,9 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 HELPER="$TMP_DIR/derive_public_key.sh"
 awk '
-    /derive_public_key\(\) \{/ {inside=1}
+    /private_key_hash\(\) \{/ {inside=1}
     inside {print}
-    inside && /^}/ {exit}
+    inside && /^}/ {closed++; if (closed == 4) exit}
 ' "$ROOT/xray_deploy.sh" > "$HELPER"
 
 cat > "$TMP_DIR/xray" <<'SH'
@@ -30,9 +30,12 @@ esac
 SH
 chmod +x "$TMP_DIR/xray"
 
-PATH="$TMP_DIR:$PATH" RED="" NC="" XRAY_FAKE_MODE=ok bash -c "source '$HELPER'; got=\$(derive_public_key PRIV); [ \"\$got\" = PUBKEY ]"
-PATH="$TMP_DIR:$PATH" RED="" NC="" XRAY_FAKE_MODE=fail bash -c "source '$HELPER'; ! derive_public_key PRIV >/dev/null"
-PATH="$TMP_DIR:$PATH" RED="" NC="" XRAY_FAKE_MODE=empty bash -c "source '$HELPER'; ! derive_public_key PRIV >/dev/null"
+RED="" NC="" PUBLIC_KEY_CACHE_FILE="$TMP_DIR/public_key_cache" XRAY_BIN="$TMP_DIR/xray" XRAY_FAKE_MODE=ok \
+    bash -c "source '$HELPER'; got=\$(derive_public_key PRIV); [ \"\$got\" = PUBKEY ]; XRAY_FAKE_MODE=fail got=\$(derive_public_key PRIV); [ \"\$got\" = PUBKEY ]"
+RED="" NC="" PUBLIC_KEY_CACHE_FILE="$TMP_DIR/public_key_cache_fail" XRAY_BIN="$TMP_DIR/xray" XRAY_FAKE_MODE=fail \
+    bash -c "source '$HELPER'; ! derive_public_key PRIV >/dev/null"
+RED="" NC="" PUBLIC_KEY_CACHE_FILE="$TMP_DIR/public_key_cache_empty" XRAY_BIN="$TMP_DIR/xray" XRAY_FAKE_MODE=empty \
+    bash -c "source '$HELPER'; ! derive_public_key PRIV >/dev/null"
 
 PORT_SNIPPETS="$(awk '
     /PORTS=.*python3 -c "/ {inside=1}
@@ -43,7 +46,7 @@ PORT_SNIPPETS="$(awk '
 count="$(grep -c "if inb.get('tag') == 'api-in': continue" <<< "$PORT_SNIPPETS")"
 [ "$count" -ge 2 ]
 
-grep -Fq 'NEW_LINK="vless://${UUID}@${VPS_IP}:${NEW_PORT}' "$ROOT/xray_deploy.sh"
+grep -Fq 'NEW_LINK="vless://${UUID}@${LINK_HOST}:${NEW_PORT}' "$ROOT/xray_deploy.sh"
 grep -Fq 'type=tcp#${NODE_NAME}"' "$ROOT/xray_deploy.sh"
 
 echo "public key and port filtering ok"

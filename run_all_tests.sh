@@ -39,15 +39,26 @@ fi
 echo ""
 echo "=== 单元测试 ==="
 run "test_parser.py (SOCKS5 输入解析)" python3 test_parser.py
+run "test_prompt_read_eof.sh (交互 EOF 优雅退出)" bash test_prompt_read_eof.sh
+run "test_prompt_read_trim.sh (交互输入空白修剪)" bash test_prompt_read_trim.sh
+run "test_get_ip_eof.sh (get_ip EOF 返回失败)" bash test_get_ip_eof.sh
 run "test_next_port.sh (入站端口计算)" bash test_next_port.sh
 run "test_public_key_and_ports.sh (public key 与业务端口)" bash test_public_key_and_ports.sh
 run "test_atomic_config.sh (配置原子写入)" bash test_atomic_config.sh
+run "test_restart_rollback_permissions.sh (回滚权限恢复)" bash test_restart_rollback_permissions.sh
 run "test_info_parse.sh (INFO_FILE 解析)" bash test_info_parse.sh
+run "test_subscription_file.sh (订阅文件生成)" bash test_subscription_file.sh
 run "test_smtp_validate.sh (SMTP 输入校验)" bash test_smtp_validate.sh
 run "test_firewall_capture.sh (防火墙 rc 链路)" bash test_firewall_capture.sh
+run "test_nft_firewall.sh (nftables 链识别)" bash test_nft_firewall.sh
+run "test_nft_firewall_revoke.sh (nftables 端口回收)" bash test_nft_firewall_revoke.sh
+run "test_crontab_cleanup.sh (卸载 cron 清理)" bash test_crontab_cleanup.sh
+run "test_delete_node_outbound_match.sh (删除节点 outbound 精确匹配)" bash test_delete_node_outbound_match.sh
 run "test_traffic_record.sh (流量统计首次 delta)" bash test_traffic_record.sh
 run "test_monitor_alert.sh (监控告警去重)" bash test_monitor_alert.sh
 run "test_config_remarks.sh (节点备注持久化)" bash test_config_remarks.sh
+run "test_rename_node.sh (节点名称修改)" bash test_rename_node.sh
+run "test_batch_direct_nodes.sh (批量 VPS 直连节点)" bash test_batch_direct_nodes.sh
 
 echo ""
 echo "=== 总结 ==="
