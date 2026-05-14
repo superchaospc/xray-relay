@@ -3,6 +3,12 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.13 改进点：
+#    - 新增菜单 15) 修改节点名称，可选择住宅 SOCKS5 或 VPS 直连节点改名
+#    - 改名走临时配置 → xray run -test 校验 → 原子替换流程，失败自动回滚
+#    - 同步刷新 _remark、/root/xray_nodes_info.txt、/root/xray_subscription.txt
+#    - 新增 test_rename_node.sh 覆盖住宅/直连节点改名与旧 INFO 名称覆盖
+#
 #  v2.2.12 修复点：
 #    - 修复 prompt_read 保留首尾空白导致菜单/数字/确认输入匹配失败的回归
 #    - 卸载时同步清理 /root/.xray_public_key
@@ -2896,6 +2902,147 @@ PYEOF
     fi
 }
 
+# ========== 修改节点名称 ==========
+rename_node() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}未找到配置文件！${NC}"; return
+    fi
+
+    echo -e "${GREEN}[修改节点名称]${NC}"
+    echo "当前节点:"
+    CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
+import json
+import os
+
+with open(os.environ["CONFIG_FILE"]) as f:
+    config = json.load(f)
+
+outbounds = {ob.get("tag"): ob for ob in config.get("outbounds", [])}
+route_by_inbound = {}
+for rule in config.get("routing", {}).get("rules", []):
+    out_tag = rule.get("outboundTag")
+    for tag in rule.get("inboundTag", []) or []:
+        route_by_inbound[tag] = out_tag
+
+i = 0
+for inb in config.get("inbounds", []):
+    if inb.get("tag") == "api-in":
+        continue
+    i += 1
+    tag = inb.get("tag", "unknown")
+    port = inb.get("port", "?")
+    out_tag = route_by_inbound.get(tag, "")
+    name = inb.get("_remark") or ("VPS-Direct" if out_tag == "direct" else f"Port-{port}")
+    dest = ""
+    if out_tag == "direct":
+        dest = " → VPS 直连"
+    elif out_tag:
+        servers = outbounds.get(out_tag, {}).get("settings", {}).get("servers", [])
+        if servers:
+            dest = f" → {servers[0].get('address', '?')}:{servers[0].get('port', '?')}"
+    print(f"  {i}) {name} | 端口 {port}{dest} [{tag}]")
+PYEOF
+
+    echo ""
+    local IDX NEW_NAME SAFE_NAME RENAME_PORT
+    prompt_read IDX -rp "选择要改名的节点编号: "
+    prompt_read NEW_NAME -rp "新的节点名称: "
+    if [ -z "$IDX" ] || [ -z "$NEW_NAME" ]; then
+        echo -e "${RED}输入不能为空${NC}"; return
+    fi
+    SAFE_NAME=$(sanitize_node_name "$NEW_NAME" "Node-${IDX}")
+
+    if ! RENAME_PORT=$(CONFIG_FILE="$CONFIG_FILE" IDX="$IDX" python3 << 'PYEOF'
+import json
+import os
+import sys
+
+try:
+    idx = int(os.environ["IDX"]) - 1
+except ValueError:
+    sys.exit(2)
+
+with open(os.environ["CONFIG_FILE"]) as f:
+    config = json.load(f)
+business = [inb for inb in config.get("inbounds", []) if inb.get("tag") != "api-in"]
+if not (0 <= idx < len(business)):
+    sys.exit(2)
+print(business[idx].get("port", ""))
+PYEOF
+    ); then
+        echo -e "${RED}编号无效${NC}"
+        return
+    fi
+
+    local NEW_CONFIG
+    if ! NEW_CONFIG=$(create_config_workfile copy); then
+        return
+    fi
+
+    if ! NEW_CONFIG_FILE="$NEW_CONFIG" IDX="$IDX" NEW_NAME="$SAFE_NAME" python3 << 'PYEOF'
+import json
+import os
+import sys
+
+new_config = os.environ["NEW_CONFIG_FILE"]
+new_name = os.environ["NEW_NAME"]
+try:
+    idx = int(os.environ["IDX"]) - 1
+except ValueError:
+    print("编号必须是整数")
+    sys.exit(2)
+
+with open(new_config) as f:
+    config = json.load(f)
+business = [inb for inb in config.get("inbounds", []) if inb.get("tag") != "api-in"]
+if not (0 <= idx < len(business)):
+    print(f"编号无效（应在 1-{len(business)} 之间）")
+    sys.exit(2)
+
+target = business[idx].get("tag")
+old_name = business[idx].get("_remark") or f"Port-{business[idx].get('port', '?')}"
+for inb in config.get("inbounds", []):
+    if inb.get("tag") == target:
+        inb["_remark"] = new_name
+        break
+
+with open(new_config, "w") as f:
+    json.dump(config, f, indent=4)
+print(f"节点名称已从 {old_name} 修改为 {new_name}")
+PYEOF
+    then
+        echo -e "${RED}✗ 改名取消（编号无效或参数错误），原配置保持不变${NC}"
+        rm -f "$NEW_CONFIG"
+        return
+    fi
+
+    if ! validate_and_install_config "$NEW_CONFIG"; then
+        echo -e "${RED}配置校验失败，已保留原配置${NC}"; return
+    fi
+
+    REFRESH_NAME_PORT="$RENAME_PORT" REFRESH_NAME="$SAFE_NAME" refresh_info_file_from_config || true
+    echo -e "${GREEN}✓ 节点名称修改成功${NC}"
+    echo -e "${GREEN}新名称: ${SAFE_NAME}${NC}"
+    if [ -f "$INFO_FILE" ]; then
+        awk -v port="$RENAME_PORT" '
+            /^=== / {block=$0 ORS; found=0; next}
+            /^端口: / {
+                block=block $0 ORS
+                if ($2 == port) found=1
+                next
+            }
+            {
+                block=block $0 ORS
+                if (found && /^链接: /) {
+                    print
+                    exit
+                }
+            }
+        ' "$INFO_FILE"
+    fi
+    print_subscription_info
+}
+
 # ========== 删除节点（同样的安全模式）==========
 delete_node() {
     if [ ! -f "$CONFIG_FILE" ]; then
@@ -3774,9 +3921,10 @@ main_menu() {
     echo "  12) 添加 VPS 直连节点"
     echo "  13) 批量添加住宅 SOCKS5 节点"
     echo "  14) 批量添加 VPS 直连节点"
+    echo "  15) 修改节点名称"
     echo "  0) 退出"
     echo ""
-    prompt_read CHOICE -rp "请选择 [0-14]: "
+    prompt_read CHOICE -rp "请选择 [0-15]: "
 
     case $CHOICE in
         1)
@@ -3803,6 +3951,7 @@ main_menu() {
         12) add_direct_node;;
         13) add_batch_nodes;;
         14) add_batch_direct_nodes;;
+        15) rename_node;;
         0)  exit 0;;
         *)  echo -e "${RED}无效选项${NC}";;
     esac

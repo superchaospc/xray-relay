@@ -72,7 +72,7 @@ assert routes[("vless-in-7",)] == "direct"
 PY
 
 grep -Fq "14) 批量添加 VPS 直连节点" "$ROOT/xray_deploy.sh"
-grep -Fq "请选择 [0-14]" "$ROOT/xray_deploy.sh"
+grep -Fq "请选择 [0-15]" "$ROOT/xray_deploy.sh"
 grep -Fq "XRAY_PRINT_SUB_DATA_URL=1 print_subscription_info" "$ROOT/xray_deploy.sh"
 
 echo "batch direct nodes ok"

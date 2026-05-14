@@ -20,7 +20,7 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🔐 **VLESS + REALITY + XTLS-Vision** 满血配置，默认伪装目标为 `www.cloudflare.com`，可用环境变量覆盖
 - 🌉 **中转架构**：VPS 入口 → 前置 SOCKS5（住宅 IP）出口，也支持纯 VPS 直连模式
 - 🎯 **固定端口映射**：每个前置节点绑定独立监听端口，客户端可精确选择出口，不做负载均衡
-- 🧩 **多节点管理**：菜单化添加、删除节点，修改端口
+- 🧩 **多节点管理**：菜单化添加、删除节点，修改端口和节点名称
 - 🏘️ **批量住宅节点**：一次最多导入 20 个住宅 SOCKS5 节点，自动生成端口、线路名称、链接和二维码
 - 🚀 **批量直连节点**：一次最多生成 30 个 VPS 直连节点，自动命名为 `VPS-Direct-1` 起并刷新订阅
 - 🛟 **安全写配置**：生成临时 JSON → `xray run -test` 校验 → 备份旧配置 → 原子替换 → 启动失败自动回滚
@@ -32,6 +32,15 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🚨 **监控报警**：可选配置邮件告警（Gmail/QQ/163 等 SMTP），每分钟巡检，异常自动发信
 - 📱 **终端二维码**：节点生成后直接在终端渲染 VLESS 二维码，主流客户端扫码即导入
 - 🐧 **多发行版支持**：Debian / Ubuntu / CentOS / AlmaLinux / Rocky / Fedora
+
+---
+
+## 🆕 v2.2.13 关键改动
+
+- 新增 `15) 修改节点名称`：菜单 1-14 编号保持不变，可选择任意住宅 SOCKS5 或 VPS 直连节点并更新 `_remark`、`/root/xray_nodes_info.txt` 与 `/root/xray_subscription.txt`，无需重启 Xray
+- 改名走「写临时文件 → `xray run -test` 校验 → 原子替换」流程，编号非法或参数错误会自动放弃改动并保留原配置
+- 节点列表统一显示业务节点（住宅 SOCKS5 与 VPS 直连），便于在多节点环境下精确选择
+- 新增 `test_rename_node.sh`，覆盖住宅 / 直连节点 `_remark` 改名以及旧 `INFO_FILE` 名称的覆盖刷新
 
 ---
 
@@ -348,6 +357,7 @@ XRAY_PRINT_SUB_DATA_URL=1 bash xray_deploy.sh
 | 12 | 添加 VPS 直连节点（不经住宅 IP） |
 | 13 | 批量添加住宅 SOCKS5 节点（最多 20 个） |
 | 14 | 批量添加 VPS 直连节点（最多 30 个） |
+| 15 | 修改节点名称（住宅 SOCKS5 / VPS 直连均支持） |
 | 0 | 退出 |
 
 ---
@@ -398,7 +408,7 @@ flowchart LR
 
 `/usr/local/etc/xray/config.json` 由脚本写入或回滚后会强制设置为 `640 root:<Xray 服务用户主组>`。这样可以避免 `600 root:root` 导致非 root Xray 服务用户读取失败，也避免 `644` 让本地非服务用户读取 UUID/REALITY 私钥。
 
-> 说明：脚本会在 Xray inbound 内写入 `_remark` 字段作为节点名称元数据。当前 Xray 会忽略未知字段；该字段只供脚本在修改端口、删除节点、重建 `/root/xray_nodes_info.txt` 时恢复节点备注使用。
+> 说明：脚本会在 Xray inbound 内写入 `_remark` 字段作为节点名称元数据。当前 Xray 会忽略未知字段；该字段只供脚本在修改节点名称、修改端口、删除节点、重建 `/root/xray_nodes_info.txt` 时恢复节点备注使用。
 
 ---
 
@@ -430,6 +440,7 @@ bash run_all_tests.sh
 - `shellcheck -S error xray_deploy.sh`（未安装则跳过）
 - `test_parser.py`：SOCKS5 输入解析，包括 URL 端口非法、IPv6、密码特殊字符
 - `test_prompt_read_eof.sh`：交互提示在 stdin EOF 时优雅退出
+- `test_prompt_read_trim.sh`：交互输入自动修剪首尾空白
 - `test_get_ip_eof.sh`：公网 IP 获取在 EOF 场景下返回失败
 - `test_next_port.sh`：入站端口计算，包括端口耗尽时返回非 0
 - `test_public_key_and_ports.sh`：public key 派生失败、业务端口过滤与端口修改链接备注
@@ -446,11 +457,13 @@ bash run_all_tests.sh
 - `test_traffic_record.sh`：流量统计首次记录 delta=0
 - `test_monitor_alert.sh`：监控告警按故障详情去重
 - `test_config_remarks.sh`：节点备注写入配置并可恢复
+- `test_rename_node.sh`：住宅与直连节点名称可修改并刷新订阅
+- `test_batch_direct_nodes.sh`：批量 VPS 直连节点写入与菜单入口
 
 当前测试结果：
 
 ```text
-通过: 20  失败: 0  跳过: 0
+通过: 23  失败: 0  跳过: 0
 ```
 
 如果系统未安装 `shellcheck`，静态检查会自动跳过该项。
