@@ -9,7 +9,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?style=flat-square&logo=linux&logoColor=black)
 ![Xray](https://img.shields.io/badge/Core-Xray-2F6FED?style=flat-square)
 
-VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS 直连线路**，也支持 **VPS 入口 → 住宅 SOCKS5 出口** 的中转线路；支持多节点、固定端口→节点映射、配置自动校验回滚、流量统计、监控报警，以及生成的 VLESS 链接自动渲染终端二维码，方便 Shadowrocket / V2rayN / V2rayNG / Neobox 直接扫码导入。
+VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS 直连线路**，也支持 **VPS 入口 → 住宅 SOCKS5 出口** 的中转线路；支持单条添加、批量生成住宅 SOCKS5 中转节点、批量生成 VPS 直连节点、固定端口→节点映射、配置自动校验回滚、流量统计、监控报警，以及生成的 VLESS 链接自动渲染终端二维码，方便 Shadowrocket / V2rayN / V2rayNG / Neobox 直接扫码导入。
 
 > ⚠️ **免责声明**：本项目仅供学习研究网络协议与系统运维使用。请用户遵守所在国家/地区的法律法规，自行承担使用后果。作者不对使用本脚本造成的任何直接或间接损失负责。
 
@@ -20,7 +20,7 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🔐 **VLESS + REALITY + XTLS-Vision** 满血配置，默认伪装目标为 `www.cloudflare.com`，可用环境变量覆盖
 - 🌉 **中转架构**：VPS 入口 → 前置 SOCKS5（住宅 IP）出口，也支持纯 VPS 直连模式
 - 🎯 **固定端口映射**：每个前置节点绑定独立监听端口，客户端可精确选择出口，不做负载均衡
-- 🧩 **多节点管理**：菜单化添加、批量导入、删除节点，修改端口
+- 🧩 **多节点管理**：菜单化添加、批量导入住宅 SOCKS5 节点、批量生成 VPS 直连节点、删除节点，修改端口
 - 🛟 **安全写配置**：生成临时 JSON → `xray run -test` 校验 → 备份旧配置 → 原子替换 → 启动失败自动回滚
 - 🧱 **自动防火墙放行**：依次尝试 `ufw` / `firewalld` / `nftables` / `iptables`，nftables 会识别真实 input 链，尽量持久化规则，并对云厂商安全组给出提醒
 - 🔒 **供应链保护**：默认固定 Xray 官方安装脚本 commit 并校验 sha256，也支持显式切回 `main`
