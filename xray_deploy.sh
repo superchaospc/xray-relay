@@ -3,6 +3,12 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.11 修复点：
+#    - 统一单条/批量直连端口占用检查，显式返回失败状态
+#    - 批量直连防火墙规则改为批量结束后统一持久化
+#    - 缓存 Reality public key，减少重复通过 xray x25519 -i 派生
+#    - 清理 shellcheck 质量问题并统一 CONFIG_FILE 读取方式
+#
 #  v2.2.10 改进点：
 #    - 新增批量添加 VPS 直连节点，一次最多自动创建 30 个直连接口
 #
@@ -78,10 +84,10 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 CONFIG_FILE="/usr/local/etc/xray/config.json"
-CONFIG_DIR="$(dirname "$CONFIG_FILE")"
 CONFIG_BACKUP_KEEP=5
 INFO_FILE="/root/xray_nodes_info.txt"
 SUB_FILE="/root/xray_subscription.txt"
+PUBLIC_KEY_CACHE_FILE="/root/.xray_public_key"
 SYSCTL_FILE="/etc/sysctl.d/99-xray.conf"
 IP_CACHE_FILE="/root/.xray_vps_ip"
 # VPS 公网 IP 缓存时间（秒）。EIP / 浮动 IP 切换后最多等 1 小时自动刷新。
@@ -118,7 +124,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.10    ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.11    ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -136,12 +142,14 @@ redact() {
 
 prompt_read() {
     local __var="$1"
+    local __value
     shift
-    if ! read "$@" "$__var"; then
+    if ! IFS= read -r "$@" __value; then
         echo "" >&2
         echo -e "${YELLOW}输入流已结束，操作取消。${NC}" >&2
         exit 0
     fi
+    printf -v "$__var" '%s' "$__value"
 }
 
 is_valid_ip_literal() {
@@ -494,7 +502,7 @@ validate_and_install_config() {
         cp -a "$CONFIG_FILE" "$backup"
         chmod 600 "$backup"
         # 仅保留最近 N 份
-        ls -1t "${CONFIG_FILE}.bak."* 2>/dev/null | tail -n +"$((CONFIG_BACKUP_KEEP+1))" | xargs -r rm -f
+        prune_config_backups
         echo -e "  ✓ 已备份原配置: $backup"
     fi
 
@@ -502,6 +510,37 @@ validate_and_install_config() {
     mv "$new_config" "$CONFIG_FILE"
     apply_config_permissions "$CONFIG_FILE" || return 1
     return 0
+}
+
+prune_config_backups() {
+    CONFIG_FILE="$CONFIG_FILE" CONFIG_BACKUP_KEEP="$CONFIG_BACKUP_KEEP" python3 << 'PYEOF'
+import glob
+import os
+
+config_file = os.environ["CONFIG_FILE"]
+keep = int(os.environ["CONFIG_BACKUP_KEEP"])
+backups = glob.glob(f"{config_file}.bak.*")
+backups.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+for path in backups[keep:]:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+PYEOF
+}
+
+latest_config_backup() {
+    CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
+import glob
+import os
+
+config_file = os.environ["CONFIG_FILE"]
+backups = glob.glob(f"{config_file}.bak.*")
+if not backups:
+    raise SystemExit(1)
+backups.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+print(backups[0])
+PYEOF
 }
 
 create_config_workfile() {
@@ -535,7 +574,7 @@ restart_with_rollback() {
 
     echo -e "${RED}✗ Xray 重启失败，准备回滚...${NC}"
     local last_backup
-    last_backup=$(ls -1t "${CONFIG_FILE}.bak."* 2>/dev/null | head -1)
+    last_backup=$(latest_config_backup 2>/dev/null || true)
     if [ -z "$last_backup" ]; then
         echo -e "${RED}✗ 找不到任何备份文件，无法自动回滚${NC}"
         echo -e "${YELLOW}  请手动检查: journalctl -u xray -n 30${NC}"
@@ -557,10 +596,12 @@ restart_with_rollback() {
 }
 
 get_next_inbound_port() {
-    python3 << 'PYEOF'
-import json, sys
-config_file = "/usr/local/etc/xray/config.json"
-with open(config_file) as f:
+    CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
+import json
+import os
+import sys
+
+with open(os.environ["CONFIG_FILE"]) as f:
     config = json.load(f)
 used = {inb.get("port", 0) for inb in config.get("inbounds", []) if inb.get("tag") != "api-in"}
 candidate = 8443
@@ -666,6 +707,58 @@ persist_nftables_rules() {
         systemctl enable nftables >/dev/null 2>&1 || true
     fi
     return 0
+}
+
+persist_iptables_rules() {
+    if command -v netfilter-persistent &>/dev/null && netfilter-persistent save >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ -d /etc/iptables ] && iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
+        return 0
+    fi
+    if command -v service &>/dev/null && service iptables save >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+record_deferred_firewall_persist() {
+    local backend="$1"
+    case " ${XRAY_FW_DEFERRED_PERSIST:-} " in
+        *" ${backend} "*) ;;
+        *) XRAY_FW_DEFERRED_PERSIST="${XRAY_FW_DEFERRED_PERSIST:-} ${backend}" ;;
+    esac
+}
+
+persist_deferred_firewall_rules() {
+    local backend rc=0 persist_rc=0
+    for backend in ${XRAY_FW_DEFERRED_PERSIST:-}; do
+        case "$backend" in
+            nft)
+                if persist_nftables_rules; then
+                    echo -e "  ${GREEN}✓ nftables 批量规则已统一持久化到 ${NFTABLES_CONF}${NC}"
+                else
+                    persist_rc=$?
+                    rc=1
+                    if [ "$persist_rc" -eq 2 ]; then
+                        echo -e "  ${YELLOW}⚠ nftables 当前已放行，但未覆盖既有配置；重启后可能失效${NC}"
+                    else
+                        echo -e "  ${YELLOW}⚠ nftables 当前已放行，但自动持久化失败，重启后可能失效${NC}"
+                    fi
+                fi
+                ;;
+            iptables)
+                if persist_iptables_rules; then
+                    echo -e "  ${GREEN}✓ iptables 批量规则已统一尝试持久化${NC}"
+                else
+                    rc=1
+                    echo -e "  ${YELLOW}⚠ iptables 当前已放行，但未检测到可用持久化工具，重启后可能失效${NC}"
+                fi
+                ;;
+        esac
+    done
+    XRAY_FW_DEFERRED_PERSIST=""
+    return "$rc"
 }
 
 nft_tcp_dport_accept_handles() {
@@ -825,7 +918,7 @@ apply_firewall_port() {
     # 例如 fail2ban 常见 f2b-table/f2b-chain，不能假设一定有 inet filter input。
     if command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q "^table"; then
         local nft_seen_input=0 nft_changed=0 nft_failed=0
-        local family table chain policy chain_rules
+        local family table chain policy
 
         while IFS=$'\t' read -r family table chain policy; do
             [ -n "${family:-}" ] && [ -n "${table:-}" ] && [ -n "${chain:-}" ] || continue
@@ -856,7 +949,10 @@ apply_firewall_port() {
 
         if [ "$nft_failed" -eq 0 ]; then
             if [ "$nft_changed" -eq 1 ]; then
-                if persist_nftables_rules; then
+                if [ "${XRAY_FW_DEFER_PERSIST:-0}" = "1" ]; then
+                    record_deferred_firewall_persist nft
+                    echo -e "  ${CYAN}ℹ nftables 规则将在批量结束后统一持久化${NC}"
+                elif persist_nftables_rules; then
                     echo -e "  ${GREEN}✓ nftables 规则已持久化到 ${NFTABLES_CONF}${NC}"
                 else
                     local persist_rc=$?
@@ -892,15 +988,10 @@ apply_firewall_port() {
                 return 3
             fi
         fi
-        local ipt_persisted=0
-        if command -v netfilter-persistent &>/dev/null && netfilter-persistent save >/dev/null 2>&1; then
-            ipt_persisted=1
-        elif [ -d /etc/iptables ] && iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
-            ipt_persisted=1
-        elif command -v service &>/dev/null && service iptables save >/dev/null 2>&1; then
-            ipt_persisted=1
-        fi
-        if [ "$ipt_persisted" -eq 1 ]; then
+        if [ "${XRAY_FW_DEFER_PERSIST:-0}" = "1" ]; then
+            record_deferred_firewall_persist iptables
+            echo -e "  ${CYAN}ℹ iptables 规则将在批量结束后统一持久化${NC}"
+        elif persist_iptables_rules; then
             echo -e "  ${GREEN}✓ iptables 规则已尝试持久化${NC}"
         else
             echo -e "  ${YELLOW}⚠ iptables 当前已放行，但未检测到可用持久化工具，重启后可能失效${NC}"
@@ -1146,17 +1237,56 @@ generate_keys() {
     echo -e "  Public Key:  ${YELLOW}${PUBLIC_KEY}${NC}"
     echo -e "  UUID:        ${YELLOW}$(redact "$UUID")${NC}"
     echo -e "  Short ID:    ${YELLOW}${SHORT_ID}${NC}"
+    cache_public_key "$PRIVATE_KEY" "$PUBLIC_KEY" || true
+}
+
+private_key_hash() {
+    PRIVATE_KEY_FOR_HASH="$1" python3 << 'PYEOF'
+import hashlib
+import os
+
+print(hashlib.sha256(os.environ["PRIVATE_KEY_FOR_HASH"].encode("utf-8")).hexdigest())
+PYEOF
+}
+
+read_cached_public_key() {
+    local private_key="$1"
+    local expected_hash cached_hash cached_public
+    [ -s "$PUBLIC_KEY_CACHE_FILE" ] || return 1
+    expected_hash=$(private_key_hash "$private_key") || return 1
+    read -r cached_hash cached_public < "$PUBLIC_KEY_CACHE_FILE" || return 1
+    [ "$cached_hash" = "$expected_hash" ] || return 1
+    [ -n "$cached_public" ] || return 1
+    echo "$cached_public"
+}
+
+cache_public_key() {
+    local private_key="$1"
+    local public_key="$2"
+    local key_hash tmp_file cache_dir
+    [ -n "$private_key" ] && [ -n "$public_key" ] || return 1
+    key_hash=$(private_key_hash "$private_key") || return 1
+    cache_dir=$(dirname "$PUBLIC_KEY_CACHE_FILE")
+    tmp_file=$(mktemp "${cache_dir}/.xray_public_key.XXXXXX") || return 1
+    printf '%s %s\n' "$key_hash" "$public_key" > "$tmp_file"
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv "$tmp_file" "$PUBLIC_KEY_CACHE_FILE"
 }
 
 derive_public_key() {
     local private_key="$1"
     local xray_bin="${XRAY_BIN:-xray}"
     local public_key
+    if public_key=$(read_cached_public_key "$private_key"); then
+        echo "$public_key"
+        return 0
+    fi
     public_key=$("$xray_bin" x25519 -i "$private_key" 2>/dev/null | grep -i "public" | awk '{print $NF}' || true)
     if [ -z "$public_key" ]; then
         echo -e "${RED}✗ 无法派生 public key，请检查 xray 二进制或 private key${NC}" >&2
         return 1
     fi
+    cache_public_key "$private_key" "$public_key" || true
     echo "$public_key"
 }
 
@@ -2011,22 +2141,22 @@ add_direct_node() {
     fi
 
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}未找到现有配置，请先完成【全新安装】！${NC}"; return
+        echo -e "${RED}未找到现有配置，请先完成【全新安装】！${NC}"; return 1
     fi
 
     load_node_identity
     if [ -z "$PRIVATE_KEY" ] || [ -z "$SHORT_ID" ] || [ -z "$UUID" ]; then
-        echo -e "${RED}现有配置密钥信息不完整${NC}"; return
+        echo -e "${RED}现有配置密钥信息不完整${NC}"; return 1
     fi
     PUBLIC_KEY=$(derive_public_key "$PRIVATE_KEY") || return
 
     if ! NEW_PORT=$(get_next_inbound_port); then
         echo -e "${RED}${NEW_PORT:-ERROR: 无法计算下一个监听端口}${NC}"
-        return
+        return 1
     fi
-    while port_in_use "$NEW_PORT"; do
+    while port_in_use "$NEW_PORT" || config_port_in_use "$NEW_PORT"; do
         NEW_PORT=$((NEW_PORT + 1))
-        if [ "$NEW_PORT" -gt 20000 ]; then echo -e "${RED}无可用端口${NC}"; return; fi
+        if [ "$NEW_PORT" -gt 20000 ]; then echo -e "${RED}无可用端口${NC}"; return 1; fi
     done
     echo -e "新的监听端口: ${NEW_PORT}"
 
@@ -2040,7 +2170,7 @@ add_direct_node() {
 
     local NEW_CONFIG
     if ! NEW_CONFIG=$(create_config_workfile copy); then
-        return
+        return 1
     fi
 
     if ! NEW_CONFIG_FILE="$NEW_CONFIG" \
@@ -2086,11 +2216,11 @@ PYEOF
     then
         echo -e "${RED}配置生成失败${NC}"
         rm -f "$NEW_CONFIG"
-        return
+        return 1
     fi
 
     if ! validate_and_install_config "$NEW_CONFIG"; then
-        echo -e "${RED}配置校验失败${NC}"; return
+        echo -e "${RED}配置校验失败${NC}"; return 1
     fi
 
     if restart_with_rollback; then
@@ -2120,13 +2250,13 @@ add_batch_direct_nodes() {
 
     if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "${RED}未找到现有配置，请先完成【全新安装】！${NC}"
-        return
+        return 1
     fi
 
     load_node_identity
     if [ -z "$PRIVATE_KEY" ] || [ -z "$SHORT_ID" ] || [ -z "$UUID" ]; then
         echo -e "${RED}现有配置密钥信息不完整${NC}"
-        return
+        return 1
     fi
     PUBLIC_KEY=$(derive_public_key "$PRIVATE_KEY") || return
 
@@ -2142,7 +2272,7 @@ add_batch_direct_nodes() {
     local NEXT_PORT NEXT_TAG
     if ! NEXT_PORT=$(get_next_inbound_port); then
         echo -e "${RED}${NEXT_PORT:-ERROR: 无法计算下一个监听端口}${NC}"
-        return
+        return 1
     fi
     NEXT_TAG=$(get_next_tag_num)
 
@@ -2158,7 +2288,7 @@ add_batch_direct_nodes() {
             LISTEN_PORT=$((LISTEN_PORT + 1))
             if [ "$LISTEN_PORT" -gt 20000 ]; then
                 echo -e "${RED}未找到足够的可用监听端口${NC}"
-                return
+                return 1
             fi
         done
 
@@ -2169,7 +2299,7 @@ add_batch_direct_nodes() {
 
     local NEW_CONFIG BATCH_DIRECT_DATA
     if ! NEW_CONFIG=$(create_config_workfile copy); then
-        return
+        return 1
     fi
     BATCH_DIRECT_DATA=$(printf '%s\n' "${BATCH_DIRECT_NODES[@]}")
 
@@ -2221,22 +2351,37 @@ PYEOF
     then
         echo -e "${RED}配置生成失败${NC}"
         rm -f "$NEW_CONFIG"
-        return
+        return 1
     fi
 
     if ! validate_and_install_config "$NEW_CONFIG"; then
         echo -e "${RED}配置校验失败${NC}"
-        return
+        return 1
     fi
 
     if restart_with_rollback; then
         echo ""
         echo -e "${GREEN}正在放行批量直连端口...${NC}"
+        local OLD_XRAY_FW_DEFER_PERSIST="${XRAY_FW_DEFER_PERSIST:-}"
+        local OLD_XRAY_FW_DEFERRED_PERSIST="${XRAY_FW_DEFERRED_PERSIST:-}"
+        XRAY_FW_DEFER_PERSIST=1
+        XRAY_FW_DEFERRED_PERSIST=""
         for line in "${BATCH_DIRECT_NODES[@]}"; do
             IFS=$'\x1f' read -r _ LISTEN_PORT _ <<< "$line"
             apply_firewall_port_capture "$LISTEN_PORT"
             echo -e "  ${LISTEN_PORT}: $(format_fw_status)"
         done
+        persist_deferred_firewall_rules || true
+        if [ -n "$OLD_XRAY_FW_DEFER_PERSIST" ]; then
+            XRAY_FW_DEFER_PERSIST="$OLD_XRAY_FW_DEFER_PERSIST"
+        else
+            unset XRAY_FW_DEFER_PERSIST
+        fi
+        if [ -n "$OLD_XRAY_FW_DEFERRED_PERSIST" ]; then
+            XRAY_FW_DEFERRED_PERSIST="$OLD_XRAY_FW_DEFERRED_PERSIST"
+        else
+            unset XRAY_FW_DEFERRED_PERSIST
+        fi
 
         echo ""
         echo -e "${GREEN}✓ 批量 VPS 直连节点添加成功！共 ${#BATCH_DIRECT_NODES[@]} 个${NC}"
@@ -2581,8 +2726,9 @@ PYEOF
     echo "  r) 重置当前计数"
     echo "  c) 清除历史数据"
     echo "  其他) 返回"
-    prompt_read ACTION -rp "  选择: "
-    case $ACTION in
+    local action
+    prompt_read action -rp "  选择: "
+    case $action in
         r) xray api stats --server=127.0.0.1:10085 -reset 2>/dev/null
            echo -e "${GREEN}✓ 当前计数已重置${NC}";;
         c) rm -f "$TRAFFIC_DB"; echo -e "${GREEN}✓ 历史数据已清除${NC}";;
@@ -2597,9 +2743,11 @@ change_port() {
 
     echo -e "${GREEN}[修改端口]${NC}"
     echo "当前节点端口:"
-    python3 << 'PYEOF'
+    CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
 import json
-with open("/usr/local/etc/xray/config.json") as f:
+import os
+
+with open(os.environ["CONFIG_FILE"]) as f:
     config = json.load(f)
 display_idx = 0
 for inb in config["inbounds"]:
@@ -2746,9 +2894,11 @@ delete_node() {
     fi
     echo -e "${GREEN}[删除节点]${NC}"
     echo "当前节点:"
-    python3 << 'PYEOF'
+    CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
 import json
-with open("/usr/local/etc/xray/config.json") as f:
+import os
+
+with open(os.environ["CONFIG_FILE"]) as f:
     config = json.load(f)
 i = 0
 for inb in config["inbounds"]:
@@ -2956,9 +3106,12 @@ for inb in cfg.get('inbounds',[]):
     echo ""
     echo -e "${GREEN}[5/8] SOCKS5 落地节点连通性${NC}"
     if [ -f "$CONFIG_FILE" ]; then
-        python3 << 'PYEOF'
-import json, socket
-with open("/usr/local/etc/xray/config.json") as f:
+        CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
+import json
+import os
+import socket
+
+with open(os.environ["CONFIG_FILE"]) as f:
     config = json.load(f)
 for ob in config["outbounds"]:
     if ob.get("protocol") == "socks":

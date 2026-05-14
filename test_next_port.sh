@@ -14,9 +14,7 @@ awk '
     fn && /python3 << '\''PYEOF'\''/ {inside=1; next}
     inside && /^PYEOF$/ {exit}
     inside {print}
-' "$ROOT/xray_deploy.sh" \
-    | sed "s|config_file = \"/usr/local/etc/xray/config.json\"|config_file = \"$CONFIG\"|" \
-    > "$PY"
+' "$ROOT/xray_deploy.sh" > "$PY"
 
 cat > "$CONFIG" <<'JSON'
 {
@@ -28,7 +26,7 @@ cat > "$CONFIG" <<'JSON'
 }
 JSON
 
-got="$(python3 "$PY")"
+got="$(CONFIG_FILE="$CONFIG" python3 "$PY")"
 [ "$got" = "8445" ]
 
 python3 - "$CONFIG" <<'PY'
@@ -38,7 +36,7 @@ with open(sys.argv[1], "w") as f:
     json.dump(cfg, f)
 PY
 
-if python3 "$PY" >/tmp/.next_port_out.$$ 2>&1; then
+if CONFIG_FILE="$CONFIG" python3 "$PY" >/tmp/.next_port_out.$$ 2>&1; then
     echo "端口耗尽时仍返回成功"
     cat /tmp/.next_port_out.$$
     rm -f /tmp/.next_port_out.$$

@@ -33,6 +33,16 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.11 关键改动
+
+- 统一单条 VPS 直连和批量 VPS 直连的端口占用检查，都会同时避开系统占用端口和现有配置端口
+- 批量 VPS 直连添加端口时，nftables / iptables 规则改为批量结束后统一持久化，减少重复落盘
+- Reality public key 会缓存到 `/root/.xray_public_key`，后续刷新订阅/添加节点优先读取缓存，减少重复派生
+- 清理 shellcheck 质量问题：`prompt_read` 固定 `read -r`、移除未使用变量、备份清理不再使用 `ls | tail`
+- 统一更多 Python 片段通过 `CONFIG_FILE` 环境变量读取配置，便于测试和自定义路径
+
+---
+
 ## 🆕 v2.2.10 关键改动
 
 - 新增批量添加 VPS 直连节点：输入数量后自动创建 `VPS-Direct-1` 起的直连线路，最多一次 30 个
