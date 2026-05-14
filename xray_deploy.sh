@@ -3,6 +3,11 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.12 修复点：
+#    - 修复 prompt_read 保留首尾空白导致菜单/数字/确认输入匹配失败的回归
+#    - 卸载时同步清理 /root/.xray_public_key
+#    - 明确批量防火墙延迟持久化状态使用全局变量传递
+#
 #  v2.2.11 修复点：
 #    - 统一单条/批量直连端口占用检查，显式返回失败状态
 #    - 批量直连防火墙规则改为批量结束后统一持久化
@@ -124,7 +129,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.11    ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.12    ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -144,7 +149,7 @@ prompt_read() {
     local __var="$1"
     local __value
     shift
-    if ! IFS= read -r "$@" __value; then
+    if ! read -r "$@" __value; then
         echo "" >&2
         echo -e "${YELLOW}输入流已结束，操作取消。${NC}" >&2
         exit 0
@@ -724,6 +729,9 @@ persist_iptables_rules() {
 
 record_deferred_firewall_persist() {
     local backend="$1"
+    # These are intentionally global: apply_firewall_port may be called several
+    # times from a batch flow, then persist_deferred_firewall_rules flushes once.
+    declare -g XRAY_FW_DEFERRED_PERSIST 2>/dev/null || true
     case " ${XRAY_FW_DEFERRED_PERSIST:-} " in
         *" ${backend} "*) ;;
         *) XRAY_FW_DEFERRED_PERSIST="${XRAY_FW_DEFERRED_PERSIST:-} ${backend}" ;;
@@ -732,6 +740,7 @@ record_deferred_firewall_persist() {
 
 persist_deferred_firewall_rules() {
     local backend rc=0 persist_rc=0
+    declare -g XRAY_FW_DEFERRED_PERSIST 2>/dev/null || true
     for backend in ${XRAY_FW_DEFERRED_PERSIST:-}; do
         case "$backend" in
             nft)
@@ -3214,7 +3223,7 @@ uninstall() {
         rm -rf /etc/systemd/system/xray.service.d
         systemctl daemon-reload 2>/dev/null || true
         remove_traffic_cron || true
-        rm -f "$CONFIG_FILE" "$INFO_FILE" "$SUB_FILE" "$SYSCTL_FILE" /root/.xray_traffic_db /root/.xray_traffic_record.sh \
+        rm -f "$CONFIG_FILE" "$INFO_FILE" "$SUB_FILE" "$PUBLIC_KEY_CACHE_FILE" "$SYSCTL_FILE" /root/.xray_traffic_db /root/.xray_traffic_record.sh \
               /root/.xray_monitor.conf /root/.xray_monitor.sh /root/.xray_vps_ip /root/.msmtprc \
               /tmp/.xray_node_failures /tmp/.xray_alert_lock_*
         # 配置备份保留，让用户决定是否清理
