@@ -3,6 +3,9 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.10 改进点：
+#    - 新增批量添加 VPS 直连节点，一次最多自动创建 30 个直连接口
+#
 #  v2.2.9 修复点：
 #    - 修复 nftables 回收端口时 handle 提取不匹配，导致旧端口规则残留的问题
 #    - nftables 新增规则写入 xray-relay-managed comment，回收时优先只删除脚本管理的规则
@@ -115,7 +118,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.9     ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.10    ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -2107,6 +2110,153 @@ PYEOF
     fi
 }
 
+# ========== 批量添加 VPS 直连节点 ==========
+add_batch_direct_nodes() {
+    echo -e "${GREEN}[批量添加 VPS 直连节点]${NC}"
+    echo -e "${CYAN}流量直接从 VPS 出口，目标看到的是机房 IP。${NC}"
+    if ! VPS_IP=$(get_ip); then
+        return 1
+    fi
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}未找到现有配置，请先完成【全新安装】！${NC}"
+        return
+    fi
+
+    load_node_identity
+    if [ -z "$PRIVATE_KEY" ] || [ -z "$SHORT_ID" ] || [ -z "$UUID" ]; then
+        echo -e "${RED}现有配置密钥信息不完整${NC}"
+        return
+    fi
+    PUBLIC_KEY=$(derive_public_key "$PRIVATE_KEY") || return
+
+    local DIRECT_COUNT
+    while true; do
+        prompt_read DIRECT_COUNT -rp "请输入要搭建的直连接口数量 (1-30): "
+        if [[ "$DIRECT_COUNT" =~ ^[0-9]+$ ]] && [ "$DIRECT_COUNT" -ge 1 ] && [ "$DIRECT_COUNT" -le 30 ]; then
+            break
+        fi
+        echo -e "${RED}请输入 1 到 30 之间的数字。${NC}"
+    done
+
+    local NEXT_PORT NEXT_TAG
+    if ! NEXT_PORT=$(get_next_inbound_port); then
+        echo -e "${RED}${NEXT_PORT:-ERROR: 无法计算下一个监听端口}${NC}"
+        return
+    fi
+    NEXT_TAG=$(get_next_tag_num)
+
+    local SEP=$'\x1f'
+    local BATCH_DIRECT_NODES=()
+    local i TAG_NUM LISTEN_PORT NODE_NAME
+    LISTEN_PORT="$NEXT_PORT"
+    for ((i = 1; i <= DIRECT_COUNT; i++)); do
+        TAG_NUM=$((NEXT_TAG + i - 1))
+        NODE_NAME="VPS-Direct-${i}"
+
+        while port_in_use "$LISTEN_PORT" || config_port_in_use "$LISTEN_PORT"; do
+            LISTEN_PORT=$((LISTEN_PORT + 1))
+            if [ "$LISTEN_PORT" -gt 20000 ]; then
+                echo -e "${RED}未找到足够的可用监听端口${NC}"
+                return
+            fi
+        done
+
+        BATCH_DIRECT_NODES+=("${TAG_NUM}${SEP}${LISTEN_PORT}${SEP}${NODE_NAME}")
+        echo -e "${GREEN}  ✓ 准备添加: ${NODE_NAME} (监听 ${LISTEN_PORT})${NC}"
+        LISTEN_PORT=$((LISTEN_PORT + 1))
+    done
+
+    local NEW_CONFIG BATCH_DIRECT_DATA
+    if ! NEW_CONFIG=$(create_config_workfile copy); then
+        return
+    fi
+    BATCH_DIRECT_DATA=$(printf '%s\n' "${BATCH_DIRECT_NODES[@]}")
+
+    if ! NEW_CONFIG_FILE="$NEW_CONFIG" \
+        UUID="$UUID" PRIVATE_KEY="$PRIVATE_KEY" SHORT_ID="$SHORT_ID" \
+        REALITY_DEST="$REALITY_DEST" REALITY_SERVER_NAME="$REALITY_SERVER_NAME" \
+        BATCH_DIRECT_DATA="$BATCH_DIRECT_DATA" \
+        python3 << 'PYEOF'
+import json
+import os
+
+new_config = os.environ["NEW_CONFIG_FILE"]
+uuid = os.environ["UUID"]
+private_key = os.environ["PRIVATE_KEY"]
+short_id = os.environ["SHORT_ID"]
+reality_dest = os.environ["REALITY_DEST"]
+reality_server_name = os.environ["REALITY_SERVER_NAME"]
+raw_nodes = [line for line in os.environ["BATCH_DIRECT_DATA"].splitlines() if line.strip()]
+
+with open(new_config) as f:
+    config = json.load(f)
+
+config.setdefault("inbounds", [])
+outbounds = config.setdefault("outbounds", [])
+if not any(ob.get("tag") == "direct" for ob in outbounds):
+    outbounds.append({"tag": "direct", "protocol": "freedom"})
+if not any(ob.get("tag") == "block" for ob in outbounds):
+    outbounds.append({"tag": "block", "protocol": "blackhole"})
+
+rules = config.setdefault("routing", {}).setdefault("rules", [])
+for node in raw_nodes:
+    tag_num, new_port, node_name = node.split("\x1f", 2)
+    new_port = int(new_port)
+    config["inbounds"].append({
+        "tag": f"vless-in-{tag_num}", "port": new_port, "protocol": "vless",
+        "_remark": node_name,
+        "settings": {"clients": [{"id": uuid, "flow": "xtls-rprx-vision"}], "decryption": "none"},
+        "streamSettings": {"network": "tcp", "security": "reality",
+            "realitySettings": {"dest": reality_dest, "serverNames": [reality_server_name],
+                "privateKey": private_key, "shortIds": [short_id]},
+            "sockopt": {"tcpFastOpen": True, "tcpNoDelay": True}},
+        "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
+    })
+    rules.append({"type": "field", "inboundTag": [f"vless-in-{tag_num}"], "outboundTag": "direct"})
+
+with open(new_config, "w") as f:
+    json.dump(config, f, indent=4)
+PYEOF
+    then
+        echo -e "${RED}配置生成失败${NC}"
+        rm -f "$NEW_CONFIG"
+        return
+    fi
+
+    if ! validate_and_install_config "$NEW_CONFIG"; then
+        echo -e "${RED}配置校验失败${NC}"
+        return
+    fi
+
+    if restart_with_rollback; then
+        echo ""
+        echo -e "${GREEN}正在放行批量直连端口...${NC}"
+        for line in "${BATCH_DIRECT_NODES[@]}"; do
+            IFS=$'\x1f' read -r _ LISTEN_PORT _ <<< "$line"
+            apply_firewall_port_capture "$LISTEN_PORT"
+            echo -e "  ${LISTEN_PORT}: $(format_fw_status)"
+        done
+
+        echo ""
+        echo -e "${GREEN}✓ 批量 VPS 直连节点添加成功！共 ${#BATCH_DIRECT_NODES[@]} 个${NC}"
+        REFRESH_NAME_PORT="" REFRESH_NAME="" refresh_info_file_from_config || true
+        local LINK_HOST LINK
+        LINK_HOST=$(format_vless_host "$VPS_IP")
+        for line in "${BATCH_DIRECT_NODES[@]}"; do
+            IFS=$'\x1f' read -r _ LISTEN_PORT NODE_NAME <<< "$line"
+            LINK="vless://${UUID}@${LINK_HOST}:${LISTEN_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
+            echo ""
+            echo -e "${GREEN}━━━ ${NODE_NAME} ━━━${NC}"
+            echo -e "  监听端口: ${LISTEN_PORT}"
+            echo -e "  出口: VPS 直连 (${VPS_IP})"
+            echo -e "${YELLOW}  ${LINK}${NC}"
+            show_qrcode "$LINK" "$NODE_NAME"
+        done
+        XRAY_PRINT_SUB_DATA_URL=1 print_subscription_info
+    fi
+}
+
 show_status() {
     echo -e "${GREEN}━━━ Xray 状态 ━━━${NC}"
     systemctl status xray --no-pager -l || true
@@ -3461,9 +3611,10 @@ main_menu() {
     echo "  11) 卸载"
     echo "  12) 添加 VPS 直连节点"
     echo "  13) 批量添加住宅 SOCKS5 节点"
+    echo "  14) 批量添加 VPS 直连节点"
     echo "  0) 退出"
     echo ""
-    prompt_read CHOICE -rp "请选择 [0-13]: "
+    prompt_read CHOICE -rp "请选择 [0-14]: "
 
     case $CHOICE in
         1)
@@ -3489,6 +3640,7 @@ main_menu() {
         11) uninstall;;
         12) add_direct_node;;
         13) add_batch_nodes;;
+        14) add_batch_direct_nodes;;
         0)  exit 0;;
         *)  echo -e "${RED}无效选项${NC}";;
     esac

@@ -33,6 +33,15 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.10 关键改动
+
+- 新增批量添加 VPS 直连节点：输入数量后自动创建 `VPS-Direct-1` 起的直连线路，最多一次 30 个
+- 批量直连成功后会逐条输出 VLESS 链接和终端二维码，并自动刷新 `/root/xray_subscription.txt`
+- 批量直连操作会直接打印订阅 Data URL，方便客户端一次性导入
+- 新增 `test_batch_direct_nodes.sh`，覆盖批量直连配置写入、direct 路由和菜单入口
+
+---
+
 ## 🆕 v2.2.9 关键改动
 
 - 修复 nftables 回收旧端口时 handle 提取接口不匹配的问题，改端口/删节点会正确删除旧端口规则
@@ -250,6 +259,12 @@ curl -fsSL https://raw.githubusercontent.com/superchaospc/xray-relay/main/xray_d
 5. 脚本自动完成：依赖检查 → Xray 检查/安装 → 密钥生成 → 配置校验下发 → BBR → 防火墙 → 服务启动
 6. 部署完成后会输出 VLESS 链接和二维码
 
+### 🛠️ 批量添加 VPS 直连
+
+已有配置后运行脚本，选择 **`14) 批量添加 VPS 直连节点`**，再输入要搭建的数量即可。单次最多 30 个，脚本会自动从当前可用端口继续分配，并按 `VPS-Direct-1`、`VPS-Direct-2`、`VPS-Direct-3` 的格式命名。
+
+批量直连添加成功后，脚本会逐条输出 VLESS 链接和二维码，同时刷新 `/root/xray_subscription.txt` 并打印订阅 Data URL。
+
 ### 🛠️ 首次部署住宅 SOCKS5 中转
 
 1. 运行脚本，选择 **`1) 全新安装`**
@@ -311,6 +326,7 @@ XRAY_PRINT_SUB_DATA_URL=1 bash xray_deploy.sh
 | 11 | 卸载 |
 | 12 | 添加 VPS 直连节点（不经住宅 IP） |
 | 13 | 批量添加住宅 SOCKS5 节点（最多 20 个） |
+| 14 | 批量添加 VPS 直连节点（最多 30 个） |
 | 0 | 退出 |
 
 ---

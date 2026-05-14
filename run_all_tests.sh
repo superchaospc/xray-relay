@@ -56,6 +56,7 @@ run "test_delete_node_outbound_match.sh (删除节点 outbound 精确匹配)" ba
 run "test_traffic_record.sh (流量统计首次 delta)" bash test_traffic_record.sh
 run "test_monitor_alert.sh (监控告警去重)" bash test_monitor_alert.sh
 run "test_config_remarks.sh (节点备注持久化)" bash test_config_remarks.sh
+run "test_batch_direct_nodes.sh (批量 VPS 直连节点)" bash test_batch_direct_nodes.sh
 
 echo ""
 echo "=== 总结 ==="
