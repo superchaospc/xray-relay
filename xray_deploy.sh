@@ -3,6 +3,12 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.15 修复点：
+#    - 修复菜单 6 流量统计的历史聚合：原来只按 tag 单字段累加，
+#      改端口后旧端口和新端口共享同一 tag，会显示两行一模一样的数字，且旧端口仍标当前出口 IP
+#    - 改为按 (tag, port) 双字段聚合，不在当前 inbounds 中的 (tag, port) 标记为「(已删除)」
+#    - 新增 test_traffic_show.sh 覆盖改端口后的历史聚合
+#
 #  v2.2.14 修复点：
 #    - 修复菜单 7 排错诊断 [8/8] 发现错误日志时未累加 ERRORS，避免总结行与屏幕输出自相矛盾
 #    - 同步横幅版本号到 v2.2.14
@@ -139,7 +145,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.14    ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.15    ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -2724,17 +2730,21 @@ else:
         now = int(time.time())
         periods = [("过去1小时", now-3600), ("今天", now-(now%86400)),
                    ("过去7天", now-7*86400), ("过去30天", now-30*86400)]
-        tags = sorted({(r[1], r[2]) for r in records}, key=lambda x: x[1])
+        current_pairs = {(inb.get("tag",""), inb.get("port"))
+                         for inb in config.get("inbounds",[])
+                         if inb.get("tag") and inb.get("tag") != "api-in"}
+        tags = sorted({(r[1], r[2]) for r in records}, key=lambda x: (x[1], x[0]))
         for pn, since in periods:
             print(f"\n  ━━━ {pn} ━━━")
             print(f"  {'节点':<22} {'上行':>10} {'下行':>10} {'合计':>10}")
             print(f"  {'─'*22} {'─'*10} {'─'*10} {'─'*10}")
             tu=0; td=0
             for tag, port in tags:
-                u = sum(r[3] for r in records if r[1]==tag and r[0]>=since)
-                d = sum(r[4] for r in records if r[1]==tag and r[0]>=since)
+                u = sum(r[3] for r in records if r[1]==tag and r[2]==port and r[0]>=since)
+                d = sum(r[4] for r in records if r[1]==tag and r[2]==port and r[0]>=since)
                 tu+=u; td+=d
-                dest = get_dest(tag); name = f":{port}→{dest}" if dest else f":{port}"
+                dest = get_dest(tag) if (tag, port) in current_pairs else "(已删除)"
+                name = f":{port}→{dest}" if dest else f":{port}"
                 print(f"  {name:<22} {fmt(u):>10} {fmt(d):>10} {fmt(u+d):>10}")
             print(f"  {'─'*22} {'─'*10} {'─'*10} {'─'*10}")
             print(f"  {'总计':<22} {fmt(tu):>10} {fmt(td):>10} {fmt(tu+td):>10}")

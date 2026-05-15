@@ -55,6 +55,7 @@ run "test_nft_firewall_revoke.sh (nftables 端口回收)" bash test_nft_firewall
 run "test_crontab_cleanup.sh (卸载 cron 清理)" bash test_crontab_cleanup.sh
 run "test_delete_node_outbound_match.sh (删除节点 outbound 精确匹配)" bash test_delete_node_outbound_match.sh
 run "test_traffic_record.sh (流量统计首次 delta)" bash test_traffic_record.sh
+run "test_traffic_show.sh (流量历史按 tag+port 聚合)" bash test_traffic_show.sh
 run "test_monitor_alert.sh (监控告警去重)" bash test_monitor_alert.sh
 run "test_config_remarks.sh (节点备注持久化)" bash test_config_remarks.sh
 run "test_rename_node.sh (节点名称修改)" bash test_rename_node.sh
