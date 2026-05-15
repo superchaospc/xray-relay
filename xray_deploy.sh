@@ -3,6 +3,10 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.14 修复点：
+#    - 修复菜单 7 排错诊断 [8/8] 发现错误日志时未累加 ERRORS，避免总结行与屏幕输出自相矛盾
+#    - 同步横幅版本号到 v2.2.14
+#
 #  v2.2.13 改进点：
 #    - 新增菜单 15) 修改节点名称，可选择住宅 SOCKS5 或 VPS 直连节点改名
 #    - 改名走临时配置 → xray run -test 校验 → 原子替换流程，失败自动回滚
@@ -135,7 +139,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.13    ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.14    ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -3306,6 +3310,7 @@ PYEOF
     if [ -n "$RECENT" ]; then
         echo -e "  ${YELLOW}发现错误:${NC}"
         echo "$RECENT" | sed 's/^/    /'
+        ERRORS=$((ERRORS+1))
     else
         echo -e "  ${GREEN}✓ 最近1小时无错误${NC}"
     fi

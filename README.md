@@ -35,6 +35,13 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.14 关键改动
+
+- 修复菜单 `7) 排错诊断` 第 `[8/8]` 步：journal 里发现 `error/fail/refused` 时未累加 `ERRORS`，导致总结行可能在屏幕已显示「发现错误」的情况下仍打印 `✓ 所有检查通过`
+- 同步菜单顶部横幅版本号到 v2.2.14（v2.2.13 release 包内仍显示 v2.2.12 的小瑕疵）
+
+---
+
 ## 🆕 v2.2.13 关键改动
 
 - 新增 `15) 修改节点名称`：菜单 1-14 编号保持不变，可选择任意住宅 SOCKS5 或 VPS 直连节点并更新 `_remark`、`/root/xray_nodes_info.txt` 与 `/root/xray_subscription.txt`，无需重启 Xray
