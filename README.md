@@ -39,6 +39,7 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 - 修复菜单 `6) 流量统计` 手动触发记录与 5 分钟 cron 同时运行时的竞态：记录脚本新增 `flock` 非阻塞锁，避免两个进程同时 append / truncate / rewrite `/root/.xray_traffic_db` 导致历史行丢失
 - 流量记录 delta 基线同步改为按 `(tag, port)` 记录，和 v2.2.15 的历史展示聚合口径保持一致，避免同 tag 改端口后的历史行影响当前端口 delta
+- 注意：节点改端口后，新 `(tag, port)` 的首个 5 分钟记录周期会先建立基线，期间流量不计入历史；这是为了优先保证旧端口历史不会污染新端口
 - 增强 `test_traffic_record.sh`，覆盖同 tag 不同端口历史行不会干扰当前端口增量计算
 
 ## 🆕 v2.2.15 关键改动
