@@ -3,6 +3,10 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.16 修复点：
+#    - 流量记录脚本增加 flock 非阻塞锁，避免菜单 6 手动记录与 5 分钟 cron 并发 truncate/rewrite 导致历史 DB 丢行
+#    - 流量 delta 基线从 tag 单字段改为 (tag, port)，与 v2.2.15 历史展示聚合口径保持一致
+#
 #  v2.2.15 修复点：
 #    - 修复菜单 6 流量统计的历史聚合：原来只按 tag 单字段累加，
 #      改端口后旧端口和新端口共享同一 tag，会显示两行一模一样的数字，且旧端口仍标当前出口 IP
@@ -145,7 +149,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.15    ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.16    ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -2545,8 +2549,13 @@ setup_traffic_cron() {
 CONFIG_FILE="/usr/local/etc/xray/config.json"
 TRAFFIC_DB="/root/.xray_traffic_db"
 XRAY_BIN="/usr/local/bin/xray"
+LOCK_FILE="/root/.xray_traffic_record.lock"
 [ ! -f "$CONFIG_FILE" ] && exit 0
 command -v xray &>/dev/null || exit 0
+if command -v flock &>/dev/null; then
+    exec 9>"$LOCK_FILE" || exit 0
+    flock -n 9 || exit 0
+fi
 
 CONFIG_FILE="$CONFIG_FILE" TRAFFIC_DB="$TRAFFIC_DB" XRAY_BIN="$XRAY_BIN" \
 python3 << 'PYEOF'
@@ -2587,7 +2596,7 @@ if os.path.exists(db_file):
                 parts = line.strip().split("|")
                 if len(parts) >= 5:
                     try:
-                        last_cum[parts[1]] = (int(parts[3]), int(parts[4]))
+                        last_cum[(parts[1], int(parts[2]))] = (int(parts[3]), int(parts[4]))
                     except ValueError: pass
     except Exception: pass
 
@@ -2598,11 +2607,12 @@ for inb in config.get("inbounds", []):
     port = inb.get("port", 0)
     cur_up = get_stat(f"inbound>>>{tag}>>>traffic>>>uplink")
     cur_down = get_stat(f"inbound>>>{tag}>>>traffic>>>downlink")
-    if tag not in last_cum:
+    key = (tag, port)
+    if key not in last_cum:
         delta_up = 0
         delta_down = 0
     else:
-        prev_up, prev_down = last_cum[tag]
+        prev_up, prev_down = last_cum[key]
         delta_up = cur_up if cur_up < prev_up else cur_up - prev_up
         delta_down = cur_down if cur_down < prev_down else cur_down - prev_down
     new_rows.append(f"{timestamp}|{tag}|{port}|{cur_up}|{cur_down}|{delta_up}|{delta_down}")

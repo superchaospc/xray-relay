@@ -20,6 +20,7 @@ awk '
         -e "s|^CONFIG_FILE=\"/usr/local/etc/xray/config.json\"|CONFIG_FILE=\"$CONFIG\"|" \
         -e "s|^TRAFFIC_DB=\"/root/.xray_traffic_db\"|TRAFFIC_DB=\"$DB\"|" \
         -e "s|^XRAY_BIN=\"/usr/local/bin/xray\"|XRAY_BIN=\"$XRAY\"|" \
+        -e "s|^LOCK_FILE=\"/root/.xray_traffic_record.lock\"|LOCK_FILE=\"$TMP_DIR/traffic_record.lock\"|" \
     > "$RECORDER"
 chmod +x "$RECORDER"
 
@@ -63,5 +64,17 @@ IFS='|' read -r _ tag port cur_up cur_down delta_up delta_down <<< "$second_line
 [ "$cur_down" = "2800" ]
 [ "$delta_up" = "300" ]
 [ "$delta_down" = "800" ]
+
+printf '%s|vless-in-1|444|9000|9000|0|0\n' "$(date +%s)" >> "$DB"
+PATH="$TMP_DIR:$PATH" XRAY_UP=1600 XRAY_DOWN=3000 "$RECORDER"
+third_line="$(tail -n 1 "$DB")"
+IFS='|' read -r _ tag port cur_up cur_down delta_up delta_down <<< "$third_line"
+
+[ "$tag" = "vless-in-1" ]
+[ "$port" = "443" ]
+[ "$cur_up" = "1600" ]
+[ "$cur_down" = "3000" ]
+[ "$delta_up" = "300" ]
+[ "$delta_down" = "200" ]
 
 echo "traffic record first delta ok"
