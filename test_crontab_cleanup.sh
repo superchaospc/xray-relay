@@ -56,5 +56,6 @@ if grep -q "xray_traffic_record" "$CRON_DST"; then
     exit 1
 fi
 grep -q "/root/backup.sh" "$CRON_DST"
+grep -Fq "/root/.xray_traffic_record.lock" "$ROOT/xray_deploy.sh"
 
 echo "crontab cleanup ok"

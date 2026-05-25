@@ -3,6 +3,9 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.18 修复点：
+#    - 卸载时同步清理 /root/.xray_traffic_record.lock，避免流量统计锁文件残留
+#
 #  v2.2.17 改进点：
 #    - 新增菜单 16) 批量删除节点，支持 1,3,5-7 形式选择多个住宅 SOCKS5 / VPS 直连节点
 #    - 批量删除沿用临时配置、校验、原子替换与重启回滚流程，成功后逐个回收防火墙端口并刷新订阅
@@ -153,7 +156,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.17    ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.18    ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -3610,6 +3613,7 @@ uninstall() {
         systemctl daemon-reload 2>/dev/null || true
         remove_traffic_cron || true
         rm -f "$CONFIG_FILE" "$INFO_FILE" "$SUB_FILE" "$PUBLIC_KEY_CACHE_FILE" "$SYSCTL_FILE" /root/.xray_traffic_db /root/.xray_traffic_record.sh \
+              /root/.xray_traffic_record.lock \
               /root/.xray_monitor.conf /root/.xray_monitor.sh /root/.xray_vps_ip /root/.msmtprc \
               /tmp/.xray_node_failures /tmp/.xray_alert_lock_*
         # 配置备份保留，让用户决定是否清理
