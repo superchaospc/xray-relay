@@ -35,6 +35,15 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.17 关键改动
+
+- 新增 `16) 批量删除节点`：可一次选择多个住宅 SOCKS5 或 VPS 直连节点删除，支持 `1,3,5-7` 这类编号输入
+- 批量删除继续走「写临时文件 → `xray run -test` 校验 → 原子替换 → 重启失败回滚」流程，并在成功后逐个回收被删节点端口的防火墙规则
+- 删除后自动刷新 `/root/xray_nodes_info.txt` 与 `/root/xray_subscription.txt`
+- 新增 `test_batch_delete_nodes.sh`，覆盖批量选择解析、共享 outbound 保留、未引用 outbound 删除和菜单入口
+
+---
+
 ## 🆕 v2.2.16 关键改动
 
 - 修复菜单 `6) 流量统计` 手动触发记录与 5 分钟 cron 同时运行时的竞态：记录脚本新增 `flock` 非阻塞锁，避免两个进程同时 append / truncate / rewrite `/root/.xray_traffic_db` 导致历史行丢失
@@ -380,6 +389,7 @@ XRAY_PRINT_SUB_DATA_URL=1 bash xray_deploy.sh
 | 13 | 批量添加住宅 SOCKS5 节点（最多 20 个） |
 | 14 | 批量添加 VPS 直连节点（最多 30 个） |
 | 15 | 修改节点名称（住宅 SOCKS5 / VPS 直连均支持） |
+| 16 | 批量删除节点（支持逗号 / 空格 / 范围选择） |
 | 0 | 退出 |
 
 ---
@@ -481,11 +491,12 @@ bash run_all_tests.sh
 - `test_config_remarks.sh`：节点备注写入配置并可恢复
 - `test_rename_node.sh`：住宅与直连节点名称可修改并刷新订阅
 - `test_batch_direct_nodes.sh`：批量 VPS 直连节点写入与菜单入口
+- `test_batch_delete_nodes.sh`：批量删除节点选择解析、路由和 outbound 清理
 
 当前测试结果：
 
 ```text
-通过: 23  失败: 0  跳过: 0
+通过: 25  失败: 0  跳过: 0
 ```
 
 如果系统未安装 `shellcheck`，静态检查会自动跳过该项。

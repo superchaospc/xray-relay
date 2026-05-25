@@ -60,6 +60,7 @@ run "test_monitor_alert.sh (监控告警去重)" bash test_monitor_alert.sh
 run "test_config_remarks.sh (节点备注持久化)" bash test_config_remarks.sh
 run "test_rename_node.sh (节点名称修改)" bash test_rename_node.sh
 run "test_batch_direct_nodes.sh (批量 VPS 直连节点)" bash test_batch_direct_nodes.sh
+run "test_batch_delete_nodes.sh (批量删除节点)" bash test_batch_delete_nodes.sh
 
 echo ""
 echo "=== 总结 ==="

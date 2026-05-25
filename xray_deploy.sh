@@ -3,6 +3,10 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.17 改进点：
+#    - 新增菜单 16) 批量删除节点，支持 1,3,5-7 形式选择多个住宅 SOCKS5 / VPS 直连节点
+#    - 批量删除沿用临时配置、校验、原子替换与重启回滚流程，成功后逐个回收防火墙端口并刷新订阅
+#
 #  v2.2.16 修复点：
 #    - 流量记录脚本增加 flock 非阻塞锁，避免菜单 6 手动记录与 5 分钟 cron 并发 truncate/rewrite 导致历史 DB 丢行
 #    - 流量 delta 基线从 tag 单字段改为 (tag, port)，与 v2.2.15 历史展示聚合口径保持一致
@@ -149,7 +153,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.16    ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.17    ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -3189,6 +3193,216 @@ PYEOF
     fi
 }
 
+# ========== 批量删除节点 ==========
+batch_delete_nodes() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${RED}未找到配置文件！${NC}"; return
+    fi
+    echo -e "${GREEN}[批量删除节点]${NC}"
+    echo "当前节点:"
+    CONFIG_FILE="$CONFIG_FILE" python3 << 'PYEOF'
+import json
+import os
+
+with open(os.environ["CONFIG_FILE"]) as f:
+    config = json.load(f)
+
+outbounds = {ob.get("tag"): ob for ob in config.get("outbounds", [])}
+route_by_inbound = {}
+for rule in config.get("routing", {}).get("rules", []):
+    out_tag = rule.get("outboundTag")
+    for tag in rule.get("inboundTag", []) or []:
+        route_by_inbound[tag] = out_tag
+
+i = 0
+for inb in config.get("inbounds", []):
+    if inb.get("tag") == "api-in":
+        continue
+    i += 1
+    tag = inb.get("tag", "unknown")
+    port = inb.get("port", "?")
+    out_tag = route_by_inbound.get(tag, "")
+    name = inb.get("_remark") or ("VPS-Direct" if out_tag == "direct" else f"Port-{port}")
+    dest = ""
+    if out_tag == "direct":
+        dest = " → VPS 直连"
+    elif out_tag:
+        servers = outbounds.get(out_tag, {}).get("settings", {}).get("servers", [])
+        if servers:
+            dest = f" → {servers[0].get('address', '?')}:{servers[0].get('port', '?')}"
+    print(f"  {i}) {name} | 端口 {port}{dest} [{tag}]")
+if i == 0:
+    print("  暂无可删除节点")
+PYEOF
+
+    echo ""
+    local DELETE_SELECTION CONFIRM DELETE_PORTS_FILE
+    prompt_read DELETE_SELECTION -rp "输入要删除的节点编号（支持 1,3,5-7）: "
+    if [ -z "$DELETE_SELECTION" ]; then
+        echo -e "${RED}输入不能为空${NC}"; return
+    fi
+
+    local NEW_CONFIG
+    if ! NEW_CONFIG=$(create_config_workfile copy); then
+        return
+    fi
+    DELETE_PORTS_FILE="$(mktemp /tmp/.xray_delete_ports.XXXXXX)"
+
+    if ! NEW_CONFIG_FILE="$NEW_CONFIG" DELETE_SELECTION="$DELETE_SELECTION" DELETE_PORTS_FILE="$DELETE_PORTS_FILE" python3 << 'PYEOF'
+import json
+import os
+import re
+import sys
+
+new_config = os.environ["NEW_CONFIG_FILE"]
+selection = os.environ["DELETE_SELECTION"]
+ports_file = os.environ["DELETE_PORTS_FILE"]
+
+with open(new_config) as f:
+    config = json.load(f)
+
+business = [inb for inb in config.get("inbounds", []) if inb.get("tag") != "api-in"]
+if not business:
+    print("暂无可删除节点")
+    sys.exit(2)
+
+tokens = [t for t in re.split(r"[\s,，、]+", selection.strip()) if t]
+if not tokens:
+    print("请输入至少一个节点编号")
+    sys.exit(2)
+
+selected_indexes = []
+seen = set()
+for token in tokens:
+    if not re.fullmatch(r"\d+(?:-\d+)?", token):
+        print(f"编号格式无效: {token}")
+        sys.exit(2)
+    if "-" in token:
+        start, end = [int(x) for x in token.split("-", 1)]
+        if start > end:
+            print(f"范围无效: {token}")
+            sys.exit(2)
+        expanded = range(start, end + 1)
+    else:
+        expanded = [int(token)]
+    for idx in expanded:
+        if idx < 1 or idx > len(business):
+            print(f"编号无效（应在 1-{len(business)} 之间）: {idx}")
+            sys.exit(2)
+        if idx not in seen:
+            seen.add(idx)
+            selected_indexes.append(idx)
+
+selected = [business[idx - 1] for idx in selected_indexes]
+selected_tags = {inb.get("tag") for inb in selected}
+
+outbounds = {ob.get("tag"): ob for ob in config.get("outbounds", [])}
+route_by_inbound = {}
+for rule in config.get("routing", {}).get("rules", []):
+    out_tag = rule.get("outboundTag")
+    for tag in rule.get("inboundTag", []) or []:
+        route_by_inbound[tag] = out_tag
+
+print("将删除以下节点:")
+for idx, inb in zip(selected_indexes, selected):
+    tag = inb.get("tag", "unknown")
+    port = inb.get("port", "?")
+    out_tag = route_by_inbound.get(tag, "")
+    name = inb.get("_remark") or ("VPS-Direct" if out_tag == "direct" else f"Port-{port}")
+    dest = ""
+    if out_tag == "direct":
+        dest = " → VPS 直连"
+    elif out_tag:
+        servers = outbounds.get(out_tag, {}).get("settings", {}).get("servers", [])
+        if servers:
+            dest = f" → {servers[0].get('address', '?')}:{servers[0].get('port', '?')}"
+    print(f"  {idx}) {name} | 端口 {port}{dest} [{tag}]")
+
+config["inbounds"] = [
+    inb for inb in config.get("inbounds", [])
+    if inb.get("tag") not in selected_tags
+]
+
+removed_out_tags = set()
+new_rules = []
+for rule in config.get("routing", {}).get("rules", []):
+    inbound_tags = rule.get("inboundTag", [])
+    if inbound_tags:
+        removed_here = [tag for tag in inbound_tags if tag in selected_tags]
+        if removed_here:
+            out_tag = rule.get("outboundTag")
+            if out_tag:
+                removed_out_tags.add(out_tag)
+            remaining = [tag for tag in inbound_tags if tag not in selected_tags]
+            if remaining:
+                new_rule = dict(rule)
+                new_rule["inboundTag"] = remaining
+                new_rules.append(new_rule)
+            continue
+    new_rules.append(rule)
+config.setdefault("routing", {})["rules"] = new_rules
+
+out_tags_still_used = {
+    rule.get("outboundTag")
+    for rule in config.get("routing", {}).get("rules", [])
+    if rule.get("outboundTag")
+}
+delete_out_tags = {
+    tag for tag in removed_out_tags
+    if tag not in ("direct", "block") and tag not in out_tags_still_used
+}
+if delete_out_tags:
+    config["outbounds"] = [
+        ob for ob in config.get("outbounds", [])
+        if ob.get("tag") not in delete_out_tags
+    ]
+
+with open(new_config, "w") as f:
+    json.dump(config, f, indent=4)
+
+with open(ports_file, "w") as f:
+    for inb in selected:
+        port = inb.get("port")
+        if port:
+            f.write(f"{port}\n")
+
+print(f"共 {len(selected)} 个节点待删除")
+PYEOF
+    then
+        echo -e "${RED}✗ 批量删除取消（编号无效或参数错误），原配置保持不变${NC}"
+        rm -f "$NEW_CONFIG" "$DELETE_PORTS_FILE"
+        return
+    fi
+
+    echo ""
+    prompt_read CONFIRM -rp "确认删除以上节点？输入 y 继续: "
+    if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
+        echo -e "${YELLOW}已取消，原配置保持不变${NC}"
+        rm -f "$NEW_CONFIG" "$DELETE_PORTS_FILE"
+        return
+    fi
+
+    if ! validate_and_install_config "$NEW_CONFIG"; then
+        echo -e "${RED}配置校验失败，已保留原配置${NC}"
+        rm -f "$DELETE_PORTS_FILE"
+        return
+    fi
+
+    if restart_with_rollback; then
+        while IFS= read -r port; do
+            [ -z "$port" ] && continue
+            revoke_firewall_port_capture "$port"
+            echo -e "  端口 ${port}: $(format_fw_revoke_status)"
+        done < "$DELETE_PORTS_FILE"
+        rm -f "$DELETE_PORTS_FILE"
+        refresh_info_file_from_config || true
+        echo -e "${GREEN}✓ 批量节点已删除${NC}"
+        print_subscription_info
+    else
+        rm -f "$DELETE_PORTS_FILE"
+    fi
+}
+
 troubleshoot() {
     echo -e "${CYAN}╔═══════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║              排错诊断                         ║${NC}"
@@ -3947,9 +4161,10 @@ main_menu() {
     echo "  13) 批量添加住宅 SOCKS5 节点"
     echo "  14) 批量添加 VPS 直连节点"
     echo "  15) 修改节点名称"
+    echo "  16) 批量删除节点"
     echo "  0) 退出"
     echo ""
-    prompt_read CHOICE -rp "请选择 [0-15]: "
+    prompt_read CHOICE -rp "请选择 [0-16]: "
 
     case $CHOICE in
         1)
@@ -3977,6 +4192,7 @@ main_menu() {
         13) add_batch_nodes;;
         14) add_batch_direct_nodes;;
         15) rename_node;;
+        16) batch_delete_nodes;;
         0)  exit 0;;
         *)  echo -e "${RED}无效选项${NC}";;
     esac
