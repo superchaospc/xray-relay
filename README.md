@@ -291,10 +291,20 @@ CLIENT_FP=ios REALITY_SERVER_NAME=www.apple.com REALITY_DEST=www.apple.com:443 /
 
 ## ⚡ 快速开始
 
+> 🎉 **最新版本：[v2.2.20](https://github.com/superchaospc/xray-relay/releases/tag/v2.2.20)** — 修复中文/超长节点名导致的流量统计表格列错位（按终端显示宽度对齐）。下面的命令默认拉取 `main` 分支，即包含该修复的最新版。
+
 ### 推荐方式：下载后运行
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/superchaospc/xray-relay/main/xray_deploy.sh -o /root/xray_deploy.sh
+chmod +x /root/xray_deploy.sh
+/root/xray_deploy.sh
+```
+
+如需锁定到固定版本（可复现），把 URL 里的 `main` 换成对应 tag，例如 `v2.2.20`：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/superchaospc/xray-relay/v2.2.20/xray_deploy.sh -o /root/xray_deploy.sh
 chmod +x /root/xray_deploy.sh
 /root/xray_deploy.sh
 ```
