@@ -6,6 +6,8 @@
 #  v2.2.19 改进点：
 #    - 菜单 6 流量统计新增“节点名称”列，直接显示每个端口对应的 _remark 名称
 #    - 历史统计继续按 (tag, port) 聚合，已删除/旧端口保持标记为「(已删除)」
+#    - 修复：流量统计表格按终端显示宽度（东亚全角=2列）填充对齐，
+#      中文备注/超长节点名不再让各列错位（原先用 len() 按码点数填充）
 #
 #  v2.2.18 修复点：
 #    - 卸载时同步清理 /root/.xray_traffic_record.lock，避免流量统计锁文件残留
@@ -2676,7 +2678,7 @@ show_traffic() {
 
     CONFIG_FILE="$CONFIG_FILE" TRAFFIC_DB="$TRAFFIC_DB" XRAY_BIN="/usr/local/bin/xray" \
     python3 << 'PYEOF'
-import json, subprocess, os, time
+import json, subprocess, os, time, unicodedata
 config_file = os.environ["CONFIG_FILE"]; db_file = os.environ["TRAFFIC_DB"]; xray_bin = os.environ["XRAY_BIN"]
 with open(config_file) as f:
     config = json.load(f)
@@ -2731,12 +2733,35 @@ def get_node_name(inb):
         return str(name)
     return "VPS-Direct" if get_route_outbound(inb.get("tag", "")) == "direct" else f"Port-{port}"
 
+def _cw(c):
+    # 东亚宽/全角字符占 2 列，其余占 1 列（含糊宽度按 1 处理）
+    return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+
+def dwidth(s):
+    return sum(_cw(c) for c in str(s))
+
 def clip(s, width):
     s = str(s)
-    return s if len(s) <= width else s[:max(0, width-1)] + "…"
+    if dwidth(s) <= width:
+        return s
+    out = ""; w = 0
+    for c in s:
+        cw = _cw(c)
+        if w + cw > width - 1:
+            break
+        out += c; w += cw
+    return out + "…"
+
+def lpad(s, width):
+    s = str(s)
+    return s + " " * max(0, width - dwidth(s))
+
+def rpad(s, width):
+    s = str(s)
+    return " " * max(0, width - dwidth(s)) + s
 
 print("  ━━━ 当前实时 (自上次启动) ━━━")
-print(f"  {'节点名称':<20} {'入口/出口':<24} {'上行':>10} {'下行':>10} {'合计':>10}")
+print(f"  {lpad('节点名称',20)} {lpad('入口/出口',24)} {rpad('上行',10)} {rpad('下行',10)} {rpad('合计',10)}")
 print(f"  {'─'*20} {'─'*24} {'─'*10} {'─'*10} {'─'*10}")
 total_up=0; total_down=0
 for inb in config.get("inbounds",[]):
@@ -2748,9 +2773,9 @@ for inb in config.get("inbounds",[]):
     total_up += up; total_down += down
     node_name = get_node_name(inb)
     endpoint = f":{port}→{dest}" if dest else f":{port}"
-    print(f"  {clip(node_name,20):<20} {clip(endpoint,24):<24} {fmt(up):>10} {fmt(down):>10} {fmt(up+down):>10}")
+    print(f"  {lpad(clip(node_name,20),20)} {lpad(clip(endpoint,24),24)} {rpad(fmt(up),10)} {rpad(fmt(down),10)} {rpad(fmt(up+down),10)}")
 print(f"  {'─'*20} {'─'*24} {'─'*10} {'─'*10} {'─'*10}")
-print(f"  {'总计':<20} {'':<24} {fmt(total_up):>10} {fmt(total_down):>10} {fmt(total_up+total_down):>10}")
+print(f"  {lpad('总计',20)} {lpad('',24)} {rpad(fmt(total_up),10)} {rpad(fmt(total_down),10)} {rpad(fmt(total_up+total_down),10)}")
 
 if not os.path.exists(db_file):
     print("\n  历史数据尚未积累，请等待5分钟后再查看")
@@ -2773,7 +2798,7 @@ else:
         tags = sorted({(r[1], r[2]) for r in records}, key=lambda x: (x[1], x[0]))
         for pn, since in periods:
             print(f"\n  ━━━ {pn} ━━━")
-            print(f"  {'节点名称':<20} {'入口/出口':<24} {'上行':>10} {'下行':>10} {'合计':>10}")
+            print(f"  {lpad('节点名称',20)} {lpad('入口/出口',24)} {rpad('上行',10)} {rpad('下行',10)} {rpad('合计',10)}")
             print(f"  {'─'*20} {'─'*24} {'─'*10} {'─'*10} {'─'*10}")
             tu=0; td=0
             for tag, port in tags:
@@ -2782,9 +2807,9 @@ else:
                 tu+=u; td+=d
                 node_name, dest = current_nodes.get((tag, port), ("(已删除)", "(已删除)"))
                 endpoint = f":{port}→{dest}" if dest else f":{port}"
-                print(f"  {clip(node_name,20):<20} {clip(endpoint,24):<24} {fmt(u):>10} {fmt(d):>10} {fmt(u+d):>10}")
+                print(f"  {lpad(clip(node_name,20),20)} {lpad(clip(endpoint,24),24)} {rpad(fmt(u),10)} {rpad(fmt(d),10)} {rpad(fmt(u+d),10)}")
             print(f"  {'─'*20} {'─'*24} {'─'*10} {'─'*10} {'─'*10}")
-            print(f"  {'总计':<20} {'':<24} {fmt(tu):>10} {fmt(td):>10} {fmt(tu+td):>10}")
+            print(f"  {lpad('总计',20)} {lpad('',24)} {rpad(fmt(tu),10)} {rpad(fmt(td),10)} {rpad(fmt(tu+td),10)}")
 PYEOF
 
     echo ""
