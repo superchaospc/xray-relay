@@ -3,6 +3,10 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.19 改进点：
+#    - 菜单 6 流量统计新增“节点名称”列，直接显示每个端口对应的 _remark 名称
+#    - 历史统计继续按 (tag, port) 聚合，已删除/旧端口保持标记为「(已删除)」
+#
 #  v2.2.18 修复点：
 #    - 卸载时同步清理 /root/.xray_traffic_record.lock，避免流量统计锁文件残留
 #
@@ -156,7 +160,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.18    ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.19    ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -2704,21 +2708,36 @@ def fmt(b):
     if b < 1024**3: return f"{b/1024**2:.1f} MB"
     return f"{b/1024**3:.2f} GB"
 
-def get_dest(tag):
+def get_route_outbound(tag):
     for rule in config.get("routing",{}).get("rules",[]):
         if rule.get("inboundTag") and tag in rule["inboundTag"]:
-            ot = rule.get("outboundTag","")
-            if ot == "direct": return "VPS"
-            if ot == "block": return "BLOCK"
-            for ob in config["outbounds"]:
-                if ob.get("tag") == ot:
-                    s = ob.get("settings",{}).get("servers",[])
-                    if s: return s[0]["address"]
+            return rule.get("outboundTag","")
     return ""
 
+def get_dest(tag):
+    ot = get_route_outbound(tag)
+    if ot == "direct": return "VPS"
+    if ot == "block": return "BLOCK"
+    for ob in config.get("outbounds", []):
+        if ob.get("tag") == ot:
+            s = ob.get("settings",{}).get("servers",[])
+            if s: return s[0].get("address", "")
+    return ""
+
+def get_node_name(inb):
+    port = inb.get("port", "?")
+    name = inb.get("_remark")
+    if name:
+        return str(name)
+    return "VPS-Direct" if get_route_outbound(inb.get("tag", "")) == "direct" else f"Port-{port}"
+
+def clip(s, width):
+    s = str(s)
+    return s if len(s) <= width else s[:max(0, width-1)] + "…"
+
 print("  ━━━ 当前实时 (自上次启动) ━━━")
-print(f"  {'节点':<22} {'上行':>10} {'下行':>10} {'合计':>10}")
-print(f"  {'─'*22} {'─'*10} {'─'*10} {'─'*10}")
+print(f"  {'节点名称':<20} {'入口/出口':<24} {'上行':>10} {'下行':>10} {'合计':>10}")
+print(f"  {'─'*20} {'─'*24} {'─'*10} {'─'*10} {'─'*10}")
 total_up=0; total_down=0
 for inb in config.get("inbounds",[]):
     tag = inb.get("tag","");
@@ -2727,10 +2746,11 @@ for inb in config.get("inbounds",[]):
     up = get_stat(f"inbound>>>{tag}>>>traffic>>>uplink")
     down = get_stat(f"inbound>>>{tag}>>>traffic>>>downlink")
     total_up += up; total_down += down
-    name = f":{port}→{dest}" if dest else f":{port}"
-    print(f"  {name:<22} {fmt(up):>10} {fmt(down):>10} {fmt(up+down):>10}")
-print(f"  {'─'*22} {'─'*10} {'─'*10} {'─'*10}")
-print(f"  {'总计':<22} {fmt(total_up):>10} {fmt(total_down):>10} {fmt(total_up+total_down):>10}")
+    node_name = get_node_name(inb)
+    endpoint = f":{port}→{dest}" if dest else f":{port}"
+    print(f"  {clip(node_name,20):<20} {clip(endpoint,24):<24} {fmt(up):>10} {fmt(down):>10} {fmt(up+down):>10}")
+print(f"  {'─'*20} {'─'*24} {'─'*10} {'─'*10} {'─'*10}")
+print(f"  {'总计':<20} {'':<24} {fmt(total_up):>10} {fmt(total_down):>10} {fmt(total_up+total_down):>10}")
 
 if not os.path.exists(db_file):
     print("\n  历史数据尚未积累，请等待5分钟后再查看")
@@ -2747,24 +2767,24 @@ else:
         now = int(time.time())
         periods = [("过去1小时", now-3600), ("今天", now-(now%86400)),
                    ("过去7天", now-7*86400), ("过去30天", now-30*86400)]
-        current_pairs = {(inb.get("tag",""), inb.get("port"))
+        current_nodes = {(inb.get("tag",""), inb.get("port")): (get_node_name(inb), get_dest(inb.get("tag","")))
                          for inb in config.get("inbounds",[])
                          if inb.get("tag") and inb.get("tag") != "api-in"}
         tags = sorted({(r[1], r[2]) for r in records}, key=lambda x: (x[1], x[0]))
         for pn, since in periods:
             print(f"\n  ━━━ {pn} ━━━")
-            print(f"  {'节点':<22} {'上行':>10} {'下行':>10} {'合计':>10}")
-            print(f"  {'─'*22} {'─'*10} {'─'*10} {'─'*10}")
+            print(f"  {'节点名称':<20} {'入口/出口':<24} {'上行':>10} {'下行':>10} {'合计':>10}")
+            print(f"  {'─'*20} {'─'*24} {'─'*10} {'─'*10} {'─'*10}")
             tu=0; td=0
             for tag, port in tags:
                 u = sum(r[3] for r in records if r[1]==tag and r[2]==port and r[0]>=since)
                 d = sum(r[4] for r in records if r[1]==tag and r[2]==port and r[0]>=since)
                 tu+=u; td+=d
-                dest = get_dest(tag) if (tag, port) in current_pairs else "(已删除)"
-                name = f":{port}→{dest}" if dest else f":{port}"
-                print(f"  {name:<22} {fmt(u):>10} {fmt(d):>10} {fmt(u+d):>10}")
-            print(f"  {'─'*22} {'─'*10} {'─'*10} {'─'*10}")
-            print(f"  {'总计':<22} {fmt(tu):>10} {fmt(td):>10} {fmt(tu+td):>10}")
+                node_name, dest = current_nodes.get((tag, port), ("(已删除)", "(已删除)"))
+                endpoint = f":{port}→{dest}" if dest else f":{port}"
+                print(f"  {clip(node_name,20):<20} {clip(endpoint,24):<24} {fmt(u):>10} {fmt(d):>10} {fmt(u+d):>10}")
+            print(f"  {'─'*20} {'─'*24} {'─'*10} {'─'*10} {'─'*10}")
+            print(f"  {'总计':<20} {'':<24} {fmt(tu):>10} {fmt(td):>10} {fmt(tu+td):>10}")
 PYEOF
 
     echo ""

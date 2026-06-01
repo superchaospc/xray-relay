@@ -31,9 +31,9 @@ cat > "$CONFIG" <<'JSON'
 {
   "inbounds": [
     {"tag": "api-in", "port": 10085},
-    {"tag": "vless-in-2", "port": 8443},
-    {"tag": "vless-in-3", "port": 8444},
-    {"tag": "vless-in-17", "port": 8459}
+    {"tag": "vless-in-2", "port": 8443, "_remark": "LA-Direct"},
+    {"tag": "vless-in-3", "port": 8444, "_remark": "US-Residential"},
+    {"tag": "vless-in-17", "port": 8459, "_remark": "JP-Residential"}
   ],
   "outbounds": [
     {"tag": "direct", "protocol": "freedom"},
@@ -86,30 +86,36 @@ echo "==================="
 # 断言 1：8443 行存在
 echo "$HOUR_BLOCK" | grep -Fq ":8443" || { echo "FAIL: 8443 行缺失"; exit 1; }
 
-# 断言 2：8458 显示「(已删除)」（vless-in-17 当前在 8459，不在 8458）
+# 断言 2：当前端口行显示节点名称
+echo "$HOUR_BLOCK" | grep -F ":8459" | grep -Fq "JP-Residential" || {
+    echo "FAIL: :8459 没有显示节点名称 JP-Residential"
+    exit 1
+}
+
+# 断言 3：8458 显示「(已删除)」（vless-in-17 当前在 8459，不在 8458）
 echo "$HOUR_BLOCK" | grep -F ":8458" | grep -Fq "(已删除)" || {
     echo "FAIL: :8458 没有标 (已删除)"
     exit 1
 }
 
-# 断言 3：8459 显示当前出口 161.77.92.87
+# 断言 4：8459 显示当前出口 161.77.92.87
 echo "$HOUR_BLOCK" | grep -F ":8459" | grep -Fq "161.77.92.87" || {
     echo "FAIL: :8459 没有显示当前出口"
     exit 1
 }
 
-# 断言 4：8458 和 8459 数字不同（v2.2.14 的回归就是它们一模一样）
+# 断言 5：8458 和 8459 数字不同（v2.2.14 的回归就是它们一模一样）
 LINE_8458=$(echo "$HOUR_BLOCK" | grep -F ":8458")
 LINE_8459=$(echo "$HOUR_BLOCK" | grep -F ":8459")
-if [ "$(echo "$LINE_8458" | awk '{print $2, $3, $4, $5}')" = \
-     "$(echo "$LINE_8459" | awk '{print $2, $3, $4, $5}')" ]; then
+if [ "$(echo "$LINE_8458" | awk '{print $(NF-2), $(NF-1), $NF}')" = \
+     "$(echo "$LINE_8459" | awk '{print $(NF-2), $(NF-1), $NF}')" ]; then
     echo "FAIL: 8458 和 8459 数字相同（聚合还在按 tag 单字段）"
     echo "  8458: $LINE_8458"
     echo "  8459: $LINE_8459"
     exit 1
 fi
 
-# 断言 5：8458 的合计 = 100+200 = 300，8459 的合计 = 1200+1700 = 2900
+# 断言 6：8458 的合计 = 100+200 = 300，8459 的合计 = 1200+1700 = 2900
 # 用 B/KB 都行，简单地检查数值就够。300 B 才是 100+200。
 echo "$LINE_8458" | grep -Fq "300 B" || {
     echo "FAIL: 8458 合计不是 300 B（实际: $LINE_8458）"
@@ -120,7 +126,7 @@ echo "$LINE_8459" | grep -Fq "2.8 KB" || {
     exit 1
 }
 
-# 断言 6：tags 的 (tag, port) 集合包含了两个 vless-in-17 项（旧 8458 + 新 8459）
+# 断言 7：tags 的 (tag, port) 集合包含了两个 vless-in-17 项（旧 8458 + 新 8459）
 COUNT_17=$(echo "$HOUR_BLOCK" | grep -E ":(8458|8459)" | wc -l | tr -d ' ')
 [ "$COUNT_17" = "2" ] || {
     echo "FAIL: 期望 8458 + 8459 共 2 行，实际 $COUNT_17"
