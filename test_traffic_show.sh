@@ -31,8 +31,8 @@ cat > "$CONFIG" <<'JSON'
 {
   "inbounds": [
     {"tag": "api-in", "port": 10085},
-    {"tag": "vless-in-2", "port": 8443, "_remark": "LA-Direct"},
-    {"tag": "vless-in-3", "port": 8444, "_remark": "US-Residential"},
+    {"tag": "vless-in-2", "port": 8443, "_remark": "洛杉矶直连"},
+    {"tag": "vless-in-3", "port": 8444, "_remark": "美国住宅超长备注节点用于校验截断"},
     {"tag": "vless-in-17", "port": 8459, "_remark": "JP-Residential"}
   ],
   "outbounds": [
@@ -132,5 +132,32 @@ COUNT_17=$(echo "$HOUR_BLOCK" | grep -E ":(8458|8459)" | wc -l | tr -d ' ')
     echo "FAIL: 期望 8458 + 8459 共 2 行，实际 $COUNT_17"
     exit 1
 }
+
+# 断言 8：含中文备注/超长名截断时，表格各列仍按终端显示宽度对齐
+# （回归：v2.2.19 用 len() 而非东亚显示宽度做填充，中文 _remark 会让列错位）
+CHK="$OUT" python3 - <<'PY'
+import os, sys, unicodedata
+def w(s):
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+lines = os.environ["CHK"].split("\n")
+def is_sep(l):
+    s = l.strip()
+    return bool(s) and set(s) <= {"─", " "}
+def is_row(l):
+    return l.startswith("  ") and "━━━" not in l and l.strip() != ""
+seps = [w(l) for l in lines if is_sep(l)]
+if not seps:
+    print("FAIL: 没找到分隔线，无法校验对齐"); sys.exit(1)
+ref = seps[0]
+if any(s != ref for s in seps):
+    print(f"FAIL: 分隔线宽度不一致: {seps}"); sys.exit(1)
+bad = [(w(l), l) for l in lines if is_row(l) and w(l) != ref]
+if bad:
+    print("FAIL: 表格列未对齐（显示宽度与分隔线不一致）")
+    for got, l in bad[:6]:
+        print(f"  width={got} expected={ref}: {l!r}")
+    sys.exit(1)
+print("alignment by display width ok")
+PY
 
 echo "traffic show split by (tag,port) ok"
