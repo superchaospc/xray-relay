@@ -35,6 +35,14 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.21 关键改动
+
+- 排错诊断 `[8/8] 最近错误日志` 不再把目标域名含 `error`/`fail` 字样的访问日志**成功行**（如 `accepted tcp:errortracking.deepl.com:443`）误判为错误：新增 `xray_filter_recent_errors`，先剔除 `accepted tcp/udp:` 成功行再匹配真实错误标志（`[error]`/`failed`/`rejected`/`refused`/`no route to host`/`deadline exceeded`/`i/o timeout`/`panic`）
+- 诊断时间窗口从写死的「1 小时」改为本次 Xray 服务启动时刻（新增 `xray_journal_since`），不再把上次运行 / 安装期的历史日志算进来
+- 新增 `test_diagnostic_error_filter.sh` 与 `test_diagnostic_journal_window.sh` 覆盖上述两点
+
+---
+
 ## 🆕 v2.2.20 关键改动
 
 - 修复中文/超长节点名导致的流量统计表格列错位：填充改为按终端显示宽度（东亚全角字符算 2 列）计算，而非按 Unicode 码点数

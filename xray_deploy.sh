@@ -3,6 +3,14 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.21 修复点：
+#    - 排错诊断 [8/8] 错误日志扫描不再把目标域名含 error/fail 字样的访问日志成功行
+#      （如 accepted tcp:errortracking.deepl.com）误报为错误
+#    - 新增 xray_filter_recent_errors：先剔除 accepted 成功行，再匹配真实错误标志
+#    - 诊断时间窗口从写死的「1 hour ago」改为本次 Xray 服务启动时刻（新增
+#      xray_journal_since），不再把上次运行/安装期的历史日志算进来
+#    - 新增 test_diagnostic_error_filter.sh / test_diagnostic_journal_window.sh 覆盖
+#
 #  v2.2.20 修复点：
 #    - 流量统计表格改为按终端显示宽度（东亚全角=2列）填充对齐，
 #      中文备注/超长节点名不再让各列错位（原先用 len() 按码点数填充）
@@ -164,7 +172,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.20    ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.21    ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -3453,6 +3461,30 @@ PYEOF
     fi
 }
 
+# 返回 journalctl 的时间下界：优先取本次 Xray 服务的启动时刻，只扫当前进程启动后的日志，
+# 避免把上次运行/安装期的历史日志算进来；启动时刻不可用时回退到「1 hour ago」。
+xray_journal_since() {
+    local started_at
+    started_at=$(systemctl show xray -p ExecMainStartTimestamp --value 2>/dev/null | head -n1 || true)
+    case "$started_at" in
+        ""|"n/a")
+            printf '%s\n' "1 hour ago"
+            ;;
+        *)
+            printf '%s\n' "$started_at"
+            ;;
+    esac
+}
+
+# 从 stdin 的 journal 输出中筛出 Xray 真正的错误/失败日志。
+# 访问日志成功行形如 "... accepted tcp:host:port [...]"，其目标域名可能恰好含有
+# error/fail 等字样（如 errortracking.deepl.com），不能据此判定为错误，故先整体剔除，
+# 再用错误级别标志与失败短语匹配，避免误报。
+xray_filter_recent_errors() {
+    grep -v -E "accepted (tcp|udp):" \
+        | grep -i -E "\[error\]|failed|rejected| refused|no route to host|deadline exceeded|i/o timeout|panic"
+}
+
 troubleshoot() {
     echo -e "${CYAN}╔═══════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║              排错诊断                         ║${NC}"
@@ -3590,13 +3622,14 @@ PYEOF
 
     echo ""
     echo -e "${GREEN}[8/8] 最近错误日志${NC}"
-    RECENT=$(journalctl -u xray --since "1 hour ago" --no-pager 2>/dev/null | grep -i -E "error|fail|refused" | tail -5)
+    JOURNAL_SINCE=$(xray_journal_since)
+    RECENT=$(journalctl -u xray --since "$JOURNAL_SINCE" --no-pager 2>/dev/null | xray_filter_recent_errors | tail -5)
     if [ -n "$RECENT" ]; then
         echo -e "  ${YELLOW}发现错误:${NC}"
         echo "$RECENT" | sed 's/^/    /'
         ERRORS=$((ERRORS+1))
     else
-        echo -e "  ${GREEN}✓ 最近1小时无错误${NC}"
+        echo -e "  ${GREEN}✓ 当前服务启动后无错误${NC}"
     fi
 
     echo ""
