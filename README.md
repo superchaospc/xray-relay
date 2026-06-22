@@ -25,6 +25,7 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🚀 **批量直连节点**：一次最多生成 30 个 VPS 直连节点，自动命名为 `VPS-Direct-1` 起并刷新订阅
 - 🛟 **安全写配置**：生成临时 JSON → `xray run -test` 校验 → 备份旧配置 → 原子替换 → 启动失败自动回滚
 - 🧱 **自动防火墙放行**：依次尝试 `ufw` / `firewalld` / `nftables` / `iptables`，nftables 会识别真实 input 链，尽量持久化规则，并对云厂商安全组给出提醒
+- 🛡️ **REALITY 回落滥用防护**（默认开）：用独立 nftables 表对所有对外 REALITY 端口做「每源 IP 并发上限 + 新连接速率限制 + IP 黑名单」，封顶未认证连接刷爆 dest 回落带宽（回落流量不计入 xray 统计，曾导致单机 2 天被刷 700G）；菜单 `17` 可随时刷新规则、封禁/解封 IP、查看 Top 来源 IP
 - 🔒 **供应链保护**：默认固定 Xray 官方安装脚本 commit 并校验 sha256，也支持显式切回 `main`
 - ⚡ **BBR 加速**：自动开启 BBR 拥塞控制并写入内核调优参数
 - 📊 **流量统计**：基于 Xray API 的累计上行/下行流量查看
@@ -32,6 +33,70 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 - 🚨 **监控报警**：可选配置邮件告警（Gmail/QQ/163 等 SMTP），每分钟巡检，异常自动发信
 - 📱 **终端二维码**：节点生成后直接在终端渲染 VLESS 二维码，主流客户端扫码即导入
 - 🐧 **多发行版支持**：Debian / Ubuntu / CentOS / AlmaLinux / Rocky / Fedora
+
+---
+
+## 🆕 v2.2.22 REALITY 回落滥用防护
+
+### 背景：回落（fallback）会烧掉「看不见」的流量
+
+REALITY 的 `dest`（默认 `www.cloudflare.com:443`）是一个真实外网站点，用于防主动探测——**任何未通过 REALITY 认证的连接都会被透明转发到这个外网 dest**。正常情况下这只是零星探测，但一旦端口被扫描盯上、或被人当成「到该外网站点的中继」反复拉数据，这些**回落流量不计入 Xray 的入站统计、也不留代理日志**，却实打实消耗 VPS 计费带宽。实测曾出现单机 **2 天被刷掉 ~700GB**、而 Xray 账面只有几 GB 的情况。
+
+### 这个版本做了什么
+
+默认开启一套基于 nftables 的 **回落限速 guard**（独立表 `inet xray_guard`，不干扰放行规则）：
+
+- 对所有**对外** REALITY 业务端口（自动从配置读取，排除 `api-in` 与仅监听 `127.0.0.1` 的内部 inbound）施加：
+  - **每源 IP 并发连接上限**（默认 600，防 fd 耗尽 / 连接洪流）
+  - **每源 IP 新连接速率限制**（默认 50/s，突发 100）
+  - **IP 黑名单**（v4/v6）即时丢弃
+- 阈值刻意放宽，不影响正常重度用户；规则文件自带 `add/delete table` 前缀，可重复加载、幂等
+- 持久化到 `/etc/nftables-xray-guard.nft` 并 `include` 进 `nftables.conf`，重启自动生效
+- **安装、添加节点（单/批量）、修改端口后自动刷新**；卸载时清理
+- 仅在系统有 `nft` 时生效，否则优雅跳过并提示「本地落地根治」
+
+新增菜单 **`17) 回落限速/封禁防护`**：重新应用规则、封禁/解封 IP、查看当前连接数最多的来源 IP。
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `XRAY_REALITY_GUARD` | `1` | `1` 启用 / `0` 关闭 |
+| `XRAY_GUARD_CONN_MAX` | `600` | 每源 IP 并发连接上限 |
+| `XRAY_GUARD_RATE` | `50` | 每源 IP 新连接速率（个/秒） |
+| `XRAY_GUARD_BURST` | `100` | 速率突发额度（包） |
+| `XRAY_GUARD_BLOCK_IPS` | 空 | 逗号分隔的额外封禁 IP（v4/v6） |
+| `XRAY_GUARD_BLOCKLIST_FILE` | `/root/.xray_guard_blocklist` | 黑名单文件（每行一个 IP） |
+| `XRAY_GUARD_NFT_FILE` | `/etc/nftables-xray-guard.nft` | 持久化规则文件 |
+
+### 限速 vs 根治
+
+限速 guard 能**封顶**滥用，但回落本身仍会被转发到外网 dest。若你的 VPS 流量计费很敏感，推荐**根治**——把 REALITY 的 `dest` 指向本机自签 TLS 落地，回落从此留在本地、零外网带宽：
+
+```bash
+# 1) 本机起一个仅监听 127.0.0.1 的轻量 TLS 落地（以 nginx 为例）
+apt-get update && apt-get install -y nginx-light
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  -keyout /etc/nginx/reality-dummy.key -out /etc/nginx/reality-dummy.crt \
+  -subj "/CN=www.cloudflare.com"
+rm -f /etc/nginx/sites-enabled/default
+cat > /etc/nginx/conf.d/reality-dest.conf <<'EOF'
+server {
+    listen 127.0.0.1:9443 ssl http2;     # nginx ≥1.25.1 改用单独的 http2 on;
+    server_name www.cloudflare.com;
+    ssl_certificate     /etc/nginx/reality-dummy.crt;
+    ssl_certificate_key /etc/nginx/reality-dummy.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    location / { return 200 "ok"; }
+}
+EOF
+systemctl restart nginx && systemctl enable nginx
+
+# 2) 部署时让 dest 指向本机（serverNames 保持不变，已发出去的客户端链接无需改）
+REALITY_DEST=127.0.0.1:9443 bash xray_deploy.sh
+```
+
+> 代价：主动探测者会看到自签证书（而非真 CF 证书），隐蔽性略降；但相比流量被刷爆 / VPS 被限速封停，通常很划算。XHTTP 变体 `xray-xhttp-relay` 已把这套本机落地做成 `REALITY_DEST_LOCAL=1` 开关。
 
 ---
 
