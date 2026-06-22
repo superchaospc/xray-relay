@@ -3,6 +3,18 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.22 新增（REALITY 回落滥用防护）：
+#    - 默认开启 nftables「回落限速 guard」：对所有对外 REALITY 业务端口做
+#      每源 IP 并发上限（XRAY_GUARD_CONN_MAX，默认 600）+ 新连接速率限制
+#      （XRAY_GUARD_RATE，默认 50/s）+ IP 黑名单，封顶未认证连接刷爆 dest 回落带宽
+#      （回落流量不计入 xray 统计，曾导致单机 2 天被刷 700G）。仅 nft 可用时生效，
+#      否则优雅跳过并提示用本地落地根治。
+#    - guard 用独立 nft 表 inet xray_guard，自带 add/delete table 前缀可重复加载；
+#      持久化为 /etc/nftables-xray-guard.nft 并 include 进 nftables.conf
+#    - 安装、添加节点（单/批量）、修改端口后自动刷新 guard；卸载时清理
+#    - 新增菜单 17) 回落限速/封禁防护：重新应用、封禁/解封 IP、查看 Top 来源 IP
+#    - 新增 XRAY_REALITY_GUARD/XRAY_GUARD_* 环境变量；新增 test_reality_guard.sh
+#
 #  v2.2.21 修复点：
 #    - 排错诊断 [8/8] 错误日志扫描不再把目标域名含 error/fail 字样的访问日志成功行
 #      （如 accepted tcp:errortracking.deepl.com）误报为错误
@@ -150,6 +162,22 @@ CLIENT_FP="${CLIENT_FP:-chrome}"
 REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.cloudflare.com}"
 REALITY_DEST="${REALITY_DEST:-${REALITY_SERVER_NAME}:443}"
 #
+# === REALITY 回落滥用防护 (fallback abuse guard) ===
+# REALITY 的 dest 默认指向外网真站（防主动探测）。未认证连接会被透明转发到 dest，
+# 这部分回落流量不计入 xray 统计，却实打实消耗带宽——一旦端口被探测/被人当中继刷，
+# 可能在很短时间内烧掉大量流量。本 guard 用 nftables 对所有 REALITY 业务端口做
+# 「每源 IP 并发上限 + 新连接速率限制 + 黑名单」，把这种滥用封顶，不影响正常用户。
+# 默认开启；仅在系统有 nft 时生效（无 nft 时优雅跳过并提示）。
+XRAY_REALITY_GUARD="${XRAY_REALITY_GUARD:-1}"            # 1=启用 0=关闭
+XRAY_GUARD_TABLE="${XRAY_GUARD_TABLE:-xray_guard}"       # 专用 nft 表名（独立于放行规则）
+XRAY_GUARD_CONN_MAX="${XRAY_GUARD_CONN_MAX:-600}"        # 每源 IP 并发连接上限（防 fd 耗尽/连接洪流）
+XRAY_GUARD_RATE="${XRAY_GUARD_RATE:-50}"                 # 每源 IP 新连接速率（个/秒）
+XRAY_GUARD_BURST="${XRAY_GUARD_BURST:-100}"             # 速率突发额度（包）
+XRAY_GUARD_NFT_FILE="${XRAY_GUARD_NFT_FILE:-/etc/nftables-xray-guard.nft}"
+XRAY_GUARD_BLOCKLIST_FILE="${XRAY_GUARD_BLOCKLIST_FILE:-/root/.xray_guard_blocklist}"
+# 额外封禁 IP（逗号分隔，v4/v6 皆可），首次应用时并入 blocklist 文件
+XRAY_GUARD_BLOCK_IPS="${XRAY_GUARD_BLOCK_IPS:-}"
+#
 # === Xray 官方安装脚本来源（供应链安全） ===
 #
 # 默认 pin 到已核对的 XTLS/Xray-install commit + install-release.sh sha256。
@@ -172,7 +200,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.21    ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.22    ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -1558,6 +1586,165 @@ EOF
     fi
 }
 
+# ============ REALITY 回落滥用防护 (nftables guard) ============
+#
+# reality_guard_business_ports: 输出当前 config 中所有“对外监听”的 REALITY 业务端口
+# （逗号分隔）。排除 api-in 及任何只监听 127.0.0.1/::1 的内部 inbound。
+reality_guard_business_ports() {
+    local cfg="${1:-$CONFIG_FILE}"
+    [ -f "$cfg" ] || return 0
+    python3 - "$cfg" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+INTERNAL_TAGS = {"api-in", "reality-dest-local"}
+LOCAL_LISTEN = {"127.0.0.1", "::1", "localhost"}
+ports = set()
+for inb in cfg.get("inbounds", []):
+    if inb.get("tag", "") in INTERNAL_TAGS:
+        continue
+    if inb.get("listen") in LOCAL_LISTEN:
+        continue
+    p = inb.get("port")
+    if isinstance(p, int) and 0 < p < 65536:
+        ports.add(p)
+print(",".join(str(p) for p in sorted(ports)))
+PY
+}
+
+# reality_guard_blocklist_elements: 读取 blocklist 文件 + XRAY_GUARD_BLOCK_IPS，
+# 按 v4/v6 分类后输出两行：第一行 IPv4 elements，第二行 IPv6 elements（逗号分隔）。
+reality_guard_blocklist_elements() {
+    local file="${1:-$XRAY_GUARD_BLOCKLIST_FILE}"
+    local extra="${2:-$XRAY_GUARD_BLOCK_IPS}"
+    BLOCKLIST_FILE="$file" EXTRA_IPS="$extra" python3 <<'PY' 2>/dev/null || true
+import os
+ips = []
+f = os.environ.get("BLOCKLIST_FILE", "")
+if f and os.path.exists(f):
+    for line in open(f):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            ips.append(line)
+for tok in os.environ.get("EXTRA_IPS", "").replace(",", " ").split():
+    tok = tok.strip()
+    if tok:
+        ips.append(tok)
+v4, v6, seen = [], [], set()
+for ip in ips:
+    if ip in seen:
+        continue
+    seen.add(ip)
+    (v6 if ":" in ip else v4).append(ip)
+print(", ".join(v4))
+print(", ".join(v6))
+PY
+}
+
+# build_reality_guard_ruleset: 纯函数，根据端口/黑名单生成 nft 规则文本。
+# 用法: build_reality_guard_ruleset "<ports_csv>" "<v4 elements>" "<v6 elements>"
+# 文件自带 add/delete table 前缀，可重复 nft -f 加载而不会“table 已存在”。
+build_reality_guard_ruleset() {
+    local ports_csv="$1" block4="$2" block6="$3"
+    local table="${XRAY_GUARD_TABLE:-xray_guard}"
+    local conn_max="${XRAY_GUARD_CONN_MAX:-600}"
+    local rate="${XRAY_GUARD_RATE:-50}"
+    local burst="${XRAY_GUARD_BURST:-100}"
+    local nftports="" port_rules=""
+    if [ -n "$ports_csv" ]; then
+        nftports="${ports_csv//,/, }"
+        port_rules=$(cat <<EOF
+        tcp dport { ${nftports} } ct state new meta nfproto ipv4 meter g_cl4 { ip saddr ct count over ${conn_max} } drop
+        tcp dport { ${nftports} } ct state new meta nfproto ipv4 meter g_rl4 { ip saddr limit rate over ${rate}/second burst ${burst} packets } drop
+        tcp dport { ${nftports} } ct state new meta nfproto ipv6 meter g_cl6 { ip6 saddr ct count over ${conn_max} } drop
+        tcp dport { ${nftports} } ct state new meta nfproto ipv6 meter g_rl6 { ip6 saddr limit rate over ${rate}/second burst ${burst} packets } drop
+EOF
+)
+    fi
+    cat <<EOF
+#!/usr/sbin/nft -f
+# Managed by xray-relay (${NFT_MANAGED_COMMENT}). REALITY fallback abuse guard.
+add table inet ${table}
+delete table inet ${table}
+table inet ${table} {
+    set blocklist4 { type ipv4_addr; flags interval;${block4:+ elements = { ${block4} } } }
+    set blocklist6 { type ipv6_addr; flags interval;${block6:+ elements = { ${block6} } } }
+    chain input {
+        type filter hook input priority -10; policy accept;
+        ip saddr @blocklist4 drop
+        ip6 saddr @blocklist6 drop
+${port_rules}
+    }
+}
+EOF
+}
+
+# apply_reality_guard: 生成并加载 guard 规则，写入持久化文件并 include 进 nftables.conf。
+# 幂等、可重复调用；未启用 / 无 nft 时优雅跳过。返回 0 不阻断主流程。
+apply_reality_guard() {
+    [ "${XRAY_REALITY_GUARD:-1}" = "1" ] || return 0
+    if ! command -v nft >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}⚠ 未检测到 nft，跳过 REALITY 回落限速${NC}"
+        echo -e "  ${CYAN}ℹ 可参考 README『本地落地根治』把 REALITY dest 指向本机，彻底不烧外网回落带宽${NC}"
+        return 0
+    fi
+    local ports block4 block6 elems
+    ports=$(reality_guard_business_ports)
+    elems=$(reality_guard_blocklist_elements)
+    block4=$(printf '%s\n' "$elems" | sed -n '1p')
+    block6=$(printf '%s\n' "$elems" | sed -n '2p')
+
+    if [ -z "$ports" ] && [ -z "$block4" ] && [ -z "$block6" ]; then
+        echo -e "  ${CYAN}ℹ 暂无对外 REALITY 端口，跳过回落限速${NC}"
+        return 0
+    fi
+
+    local tmp
+    tmp=$(mktemp /tmp/.xray-guard.XXXXXX.nft) || return 0
+    build_reality_guard_ruleset "$ports" "$block4" "$block6" > "$tmp"
+    if ! nft -c -f "$tmp" >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}⚠ guard 规则校验失败，跳过（不影响节点可用性）${NC}"
+        rm -f "$tmp"; return 0
+    fi
+    if ! nft -f "$tmp" >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}⚠ guard 规则加载失败，跳过${NC}"
+        rm -f "$tmp"; return 0
+    fi
+    install -m 600 "$tmp" "$XRAY_GUARD_NFT_FILE" 2>/dev/null || cp "$tmp" "$XRAY_GUARD_NFT_FILE"
+    rm -f "$tmp"
+
+    # 持久化：把 include 行加进 nftables.conf（幂等），并 enable nftables 服务
+    if [ -f "$NFTABLES_CONF" ] && ! grep -qF "$XRAY_GUARD_NFT_FILE" "$NFTABLES_CONF" 2>/dev/null; then
+        printf '\ninclude "%s"\n' "$XRAY_GUARD_NFT_FILE" >> "$NFTABLES_CONF"
+    elif [ ! -f "$NFTABLES_CONF" ]; then
+        printf '#!/usr/sbin/nft -f\ninclude "%s"\n' "$XRAY_GUARD_NFT_FILE" > "$NFTABLES_CONF"
+    fi
+    systemctl enable nftables >/dev/null 2>&1 || true
+
+    local nport_count=0
+    [ -n "$ports" ] && nport_count=$(printf '%s' "$ports" | awk -F, '{print NF}')
+    echo -e "  ${GREEN}✓ REALITY 回落限速已应用：${nport_count} 个端口 / 每源IP并发≤${XRAY_GUARD_CONN_MAX}、新连≤${XRAY_GUARD_RATE}/s${NC}"
+    if [ -n "$block4$block6" ]; then
+        echo -e "  ${GREEN}✓ 黑名单生效: ${block4}${block4:+${block6:+, }}${block6}${NC}"
+    fi
+    return 0
+}
+
+# revoke_reality_guard: 卸载/关闭时移除 guard 表、持久化文件与 include 行。
+revoke_reality_guard() {
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table inet "${XRAY_GUARD_TABLE:-xray_guard}" >/dev/null 2>&1 || true
+    fi
+    rm -f "$XRAY_GUARD_NFT_FILE" 2>/dev/null || true
+    if [ -f "$NFTABLES_CONF" ]; then
+        local esc
+        esc=$(printf '%s' "$XRAY_GUARD_NFT_FILE" | sed 's/[\/&]/\\&/g')
+        sed -i "/include \"${esc}\"/d" "$NFTABLES_CONF" 2>/dev/null || true
+    fi
+}
+
 setup_firewall() {
     echo -e "${GREEN}[步骤6] 配置防火墙...${NC}"
     local fw_rc
@@ -1572,6 +1759,7 @@ setup_firewall() {
             *) echo -e "  ${RED}⚠ 端口 ${PORT}: 防火墙处理异常 (rc=${fw_rc})${NC}" ;;
         esac
     done
+    apply_reality_guard || true
 }
 
 start_service() {
@@ -2026,6 +2214,7 @@ PYEOF
             apply_firewall_port_capture "$LISTEN_PORT"
             echo -e "  ${LISTEN_PORT}: $(format_fw_status)"
         done
+        apply_reality_guard || true
 
         echo ""
         echo -e "${GREEN}✓ 批量节点添加成功！共 ${#BATCH_NODES[@]} 个${NC}"
@@ -2169,6 +2358,7 @@ PYEOF
 
     if restart_with_rollback; then
         apply_firewall_port_capture "$NEW_PORT"
+        apply_reality_guard || true
         local LINK_HOST
         LINK_HOST=$(format_vless_host "$VPS_IP")
         LINK="vless://${UUID}@${LINK_HOST}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
@@ -2277,6 +2467,7 @@ PYEOF
 
     if restart_with_rollback; then
         apply_firewall_port_capture "$NEW_PORT"
+        apply_reality_guard || true
         local LINK_HOST
         LINK_HOST=$(format_vless_host "$VPS_IP")
         LINK="vless://${UUID}@${LINK_HOST}:${NEW_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=${CLIENT_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}"
@@ -2424,6 +2615,7 @@ PYEOF
             echo -e "  ${LISTEN_PORT}: $(format_fw_status)"
         done
         persist_deferred_firewall_rules || true
+        apply_reality_guard || true
         if [ -n "$OLD_XRAY_FW_DEFER_PERSIST" ]; then
             XRAY_FW_DEFER_PERSIST="$OLD_XRAY_FW_DEFER_PERSIST"
         else
@@ -2950,6 +3142,7 @@ PYEOF
 
     if restart_with_rollback; then
         apply_firewall_port_capture "$NEW_PORT"
+        apply_reality_guard || true
         echo -e "${GREEN}✓ 端口修改成功${NC}"
         echo -e "  $(format_fw_status)"
         if [ -n "$OLD_PORT" ] && [ "$OLD_PORT" != "$NEW_PORT" ]; then
@@ -3687,6 +3880,7 @@ uninstall() {
         systemctl stop xray-monitor.timer 2>/dev/null || true
         systemctl disable xray-monitor.timer 2>/dev/null || true
         cleanup_firewall_ports_from_config || true
+        revoke_reality_guard || true
         run_xray_installer remove || echo -e "${YELLOW}⚠ 远程卸载脚本无法运行，仅清理本地${NC}"
         rm -f /etc/systemd/system/xray-monitor.service /etc/systemd/system/xray-monitor.timer
         rm -rf /etc/systemd/system/xray.service.d
@@ -3695,6 +3889,7 @@ uninstall() {
         rm -f "$CONFIG_FILE" "$INFO_FILE" "$SUB_FILE" "$PUBLIC_KEY_CACHE_FILE" "$SYSCTL_FILE" /root/.xray_traffic_db /root/.xray_traffic_record.sh \
               /root/.xray_traffic_record.lock \
               /root/.xray_monitor.conf /root/.xray_monitor.sh /root/.xray_vps_ip /root/.msmtprc \
+              "$XRAY_GUARD_BLOCKLIST_FILE" \
               /tmp/.xray_node_failures /tmp/.xray_alert_lock_*
         # 配置备份保留，让用户决定是否清理
         echo -e "${YELLOW}注意：配置备份 ${CONFIG_FILE}.bak.* 已保留，如需清理请手动删除${NC}"
@@ -4227,6 +4422,73 @@ monitor_menu() {
     esac
 }
 
+# ========== REALITY 回落限速/封禁防护管理 ==========
+reality_guard_menu() {
+    while true; do
+        echo ""
+        echo -e "${CYAN}=== REALITY 回落限速 / 封禁防护 ===${NC}"
+        if [ "${XRAY_REALITY_GUARD:-1}" = "1" ]; then
+            echo -e "  开关: ${GREEN}启用${NC}（每源IP并发≤${XRAY_GUARD_CONN_MAX}、新连≤${XRAY_GUARD_RATE}/s）"
+        else
+            echo -e "  开关: ${YELLOW}已关闭（运行前设 XRAY_REALITY_GUARD=1 开启）${NC}"
+        fi
+        if command -v nft >/dev/null 2>&1 && nft list table inet "${XRAY_GUARD_TABLE}" >/dev/null 2>&1; then
+            echo -e "  nft 表: ${GREEN}已加载${NC}  保护端口: $(reality_guard_business_ports)"
+        else
+            echo -e "  nft 表: ${YELLOW}未加载${NC}"
+        fi
+        local elems b4 b6
+        elems=$(reality_guard_blocklist_elements)
+        b4=$(printf '%s\n' "$elems" | sed -n '1p')
+        b6=$(printf '%s\n' "$elems" | sed -n '2p')
+        if [ -n "$b4$b6" ]; then
+            echo -e "  黑名单: ${b4}${b4:+${b6:+, }}${b6}"
+        else
+            echo -e "  黑名单: （空）"
+        fi
+        echo ""
+        echo "  a) 重新应用 / 刷新规则（读取当前端口）"
+        echo "  b) 封禁 IP"
+        echo "  c) 解封 IP"
+        echo "  d) 查看当前连接数最多的来源 IP"
+        echo "  0) 返回主菜单"
+        prompt_read GCHOICE -rp "请选择: " || return
+        case "$GCHOICE" in
+            a)
+                apply_reality_guard || true
+                ;;
+            b)
+                prompt_read BIP -rp "要封禁的 IP: " || continue
+                [ -z "$BIP" ] && continue
+                touch "$XRAY_GUARD_BLOCKLIST_FILE" && chmod 600 "$XRAY_GUARD_BLOCKLIST_FILE"
+                if grep -qxF "$BIP" "$XRAY_GUARD_BLOCKLIST_FILE" 2>/dev/null; then
+                    echo -e "  ${YELLOW}已在黑名单${NC}"
+                else
+                    echo "$BIP" >> "$XRAY_GUARD_BLOCKLIST_FILE"
+                fi
+                apply_reality_guard || true
+                ;;
+            c)
+                prompt_read UIP -rp "要解封的 IP: " || continue
+                [ -z "$UIP" ] && continue
+                if [ -f "$XRAY_GUARD_BLOCKLIST_FILE" ] && grep -vxF "$UIP" "$XRAY_GUARD_BLOCKLIST_FILE" > "${XRAY_GUARD_BLOCKLIST_FILE}.tmp" 2>/dev/null; then
+                    mv "${XRAY_GUARD_BLOCKLIST_FILE}.tmp" "$XRAY_GUARD_BLOCKLIST_FILE"
+                    chmod 600 "$XRAY_GUARD_BLOCKLIST_FILE"
+                fi
+                apply_reality_guard || true
+                ;;
+            d)
+                echo -e "${CYAN}当前 ESTABLISHED 连接来源 IP Top 15:${NC}"
+                ss -Htn state established 2>/dev/null | awk '{print $4}' \
+                    | sed -E 's/::ffff://; s/:[0-9]+$//; s/^\[//; s/\]$//' \
+                    | sort | uniq -c | sort -rn | head -15
+                ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${NC}" ;;
+        esac
+    done
+}
+
 # ========== 主菜单 ==========
 main_menu() {
     print_banner
@@ -4246,9 +4508,10 @@ main_menu() {
     echo "  14) 批量添加 VPS 直连节点"
     echo "  15) 修改节点名称"
     echo "  16) 批量删除节点"
+    echo "  17) 回落限速/封禁防护"
     echo "  0) 退出"
     echo ""
-    prompt_read CHOICE -rp "请选择 [0-16]: "
+    prompt_read CHOICE -rp "请选择 [0-17]: "
 
     case $CHOICE in
         1)
@@ -4277,6 +4540,7 @@ main_menu() {
         14) add_batch_direct_nodes;;
         15) rename_node;;
         16) batch_delete_nodes;;
+        17) reality_guard_menu;;
         0)  exit 0;;
         *)  echo -e "${RED}无效选项${NC}";;
     esac

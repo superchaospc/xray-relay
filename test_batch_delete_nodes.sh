@@ -74,6 +74,6 @@ if NEW_CONFIG_FILE="$CONFIG_FILE" DELETE_SELECTION="2-1" DELETE_PORTS_FILE="$POR
 fi
 
 grep -Fq "16) 批量删除节点" "$ROOT/xray_deploy.sh"
-grep -Fq "请选择 [0-16]" "$ROOT/xray_deploy.sh"
+grep -Fq "请选择 [0-17]" "$ROOT/xray_deploy.sh"
 
 echo "batch delete nodes ok"
