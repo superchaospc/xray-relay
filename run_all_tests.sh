@@ -53,6 +53,7 @@ run "test_firewall_capture.sh (防火墙 rc 链路)" bash test_firewall_capture.
 run "test_nft_firewall.sh (nftables 链识别)" bash test_nft_firewall.sh
 run "test_nft_firewall_revoke.sh (nftables 端口回收)" bash test_nft_firewall_revoke.sh
 run "test_reality_guard.sh (REALITY 回落限速 guard)" bash test_reality_guard.sh
+run "test_protocol_mismatch_warn.sh (协议混用提示)" bash test_protocol_mismatch_warn.sh
 run "test_crontab_cleanup.sh (卸载 cron 清理)" bash test_crontab_cleanup.sh
 run "test_delete_node_outbound_match.sh (删除节点 outbound 精确匹配)" bash test_delete_node_outbound_match.sh
 run "test_traffic_record.sh (流量统计首次 delta)" bash test_traffic_record.sh

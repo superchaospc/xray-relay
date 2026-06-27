@@ -3,6 +3,13 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.23 新增（协议混用提示）：
+#    - 启动预检新增 check_protocol_mismatch：本脚本是 Vision (tcp+xtls-rprx-vision)
+#      版，若 config 中混入 xhttp 线路（多为误用 XHTTP 版脚本所致），进菜单前打印
+#      红字警告并点名端口/备注，提示改用 XHTTP 版脚本管理或删除。仅警告，不读
+#      stdin、不阻断，非交互喂菜单的用法不受影响；配置缺失/解析失败时静默跳过。
+#    - 新增 test_protocol_mismatch_warn.sh
+#
 #  v2.2.22 新增（REALITY 回落滥用防护）：
 #    - 默认开启 nftables「回落限速 guard」：对所有对外 REALITY 业务端口做
 #      每源 IP 并发上限（XRAY_GUARD_CONN_MAX，默认 600）+ 新连接速率限制
@@ -200,7 +207,7 @@ _QRENCODE_CHECKED=""
 print_banner() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   Xray VLESS Reality 中转部署工具 v2.2.22    ║"
+    echo "║   Xray VLESS Reality 中转部署工具 v2.2.23    ║"
     echo "║   多节点 · 一键部署 · 配置自动回滚           ║"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -4548,6 +4555,44 @@ main_menu() {
     prompt_read _ -rp "按回车键返回主菜单..."
 }
 
+# ========== 协议混用提示 ==========
+# 本脚本是 Vision (tcp+xtls-rprx-vision) 版。若 config 中混入了 xhttp 线路
+# （多半是误用 XHTTP 版脚本所致），仅打印红字警告，不读 stdin、不阻断后续操作。
+check_protocol_mismatch() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    CONFIG_FILE="$CONFIG_FILE" WARN_RED="$RED" WARN_YELLOW="$YELLOW" WARN_NC="$NC" python3 << 'PYEOF'
+import json, os, sys
+
+config_file = os.environ.get("CONFIG_FILE", "")
+red = os.environ.get("WARN_RED", "")
+yellow = os.environ.get("WARN_YELLOW", "")
+nc = os.environ.get("WARN_NC", "")
+try:
+    with open(config_file) as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(0)
+
+SKIP_TAGS = {"api", "api-in", "reality-dest-local"}
+bad = []
+for inb in cfg.get("inbounds", []) or []:
+    if inb.get("tag", "") in SKIP_TAGS:
+        continue
+    ss = inb.get("streamSettings", {}) or {}
+    if ss.get("network") == "xhttp":
+        bad.append((inb.get("port", "?"), inb.get("_remark") or inb.get("tag") or "?"))
+
+if not bad:
+    sys.exit(0)
+
+detail = "，".join(f"端口 {p} ({r})" for p, r in bad)
+print(f"{red}⚠ 检测到 {len(bad)} 条 xhttp 线路：{detail}{nc}")
+print(f"{yellow}  本脚本是 Vision (tcp+xtls-rprx-vision) 版，混用会导致这些线的链接/订阅被错误生成为 type=tcp。{nc}")
+print(f"{yellow}  请改用 XHTTP 版脚本 (superchaospc/xray-xhttp-relay) 管理它们，或在本脚本中删除。{nc}")
+sys.exit(0)
+PYEOF
+}
+
 # ========== 启动前预检 ==========
 preflight_check() {
     # root 检查
@@ -4608,6 +4653,9 @@ preflight_check() {
         osname=$(. /etc/os-release && echo "${PRETTY_NAME:-unknown}")
         echo -e "${CYAN}ℹ 系统: ${osname} ($(uname -m))${NC}"
     fi
+
+    # 协议混用提示（Vision 版里出现 xhttp 线路时警告，不阻塞）
+    check_protocol_mismatch
 }
 
 preflight_check
