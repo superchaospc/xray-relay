@@ -36,6 +36,16 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.23 协议混用提示
+
+本脚本是 **Vision (tcp + xtls-rprx-vision)** 版。如果同一台机器先后被本脚本和 [XHTTP 版脚本](https://github.com/superchaospc/xray-xhttp-relay) 都操作过，配置里就会混入 `network: xhttp` 的线路——而本脚本的链接/订阅生成只会按 Vision 格式输出 `type=tcp`，导致那些 xhttp 线路的分享链接错误、客户端连不上。
+
+这个版本在启动预检里新增 `check_protocol_mismatch`：进菜单前扫描 `config.json`，发现 xhttp 线路就打印红字警告并点名端口/备注，提示改用 XHTTP 版脚本管理它们或删除。**仅警告，不读 stdin、不阻断**，非交互喂菜单号的用法完全不受影响；配置缺失或解析失败时静默跳过。
+
+> 反向的对称提示（XHTTP 版检测到 Vision 线路时警告）见 xray-xhttp-relay v1.0.5。
+
+---
+
 ## 🆕 v2.2.22 REALITY 回落滥用防护
 
 ### 背景：回落（fallback）会烧掉「看不见」的流量
