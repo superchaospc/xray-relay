@@ -3,6 +3,15 @@
 #  Xray VLESS Reality 中转 → SOCKS5 住宅节点 万能部署脚本
 #  By Wayne Shen
 #
+#  v2.2.24 修复（重启前权限自愈）：
+#    - restart_with_rollback 在重启前无条件 apply_config_permissions，把 config.json
+#      归一化为 root:<xray 服务用户主组> 640（自动探测服务组，不写死 nogroup），修复
+#      老版本部署 / 外部改动遗留的 root:root 坏权限。内容正常、仅权限坏时，“仅重启”
+#      这条最常见路径原本不自愈 → open config.json: permission denied，服务起不来。
+#    - 交互菜单「9) 重启」改走 restart_with_rollback（自愈 + 失败回滚兜底），不再裸重启。
+#    - 监控自动重启脚本在自动拉起前先归一化 config.json 属组。
+#    - 新增 test_restart_selfheal_permissions.sh
+#
 #  v2.2.23 新增（协议混用提示）：
 #    - 启动预检新增 check_protocol_mismatch：本脚本是 Vision (tcp+xtls-rprx-vision)
 #      版，若 config 中混入 xhttp 线路（多为误用 XHTTP 版脚本所致），进菜单前打印
@@ -649,6 +658,10 @@ create_config_workfile() {
 
 # 重启 xray 并在失败时回滚到最近备份
 restart_with_rollback() {
+    # 自愈：重启前把 config.json 归一化到 xray 服务用户可读，修复老版本部署 /
+    # 外部改动遗留的 root:root 坏权限，避免“仅重启”这条最常见路径因权限坏而起不来
+    # （config 内容明明没问题）。
+    apply_config_permissions "$CONFIG_FILE" 2>/dev/null || true
     systemctl restart xray || true
     sleep 3
     if systemctl is-active --quiet xray; then
@@ -4269,6 +4282,11 @@ if ! systemctl is-active --quiet xray; then
 [故障] Xray 进程已停止"
     log "ERROR: Xray not running"
     if [ "$AUTO_RESTART" = "yes" ]; then
+        # 自愈：重启前修正 config.json 属组，避免坏权限(root:root)导致重启后仍无法启动
+        _svc_grp=$(systemctl show -p User --value xray 2>/dev/null | head -n1)
+        _svc_grp=$(id -gn "${_svc_grp:-nobody}" 2>/dev/null || echo nogroup)
+        chown "root:${_svc_grp}" "$CONFIG_FILE" 2>/dev/null || chown root:nogroup "$CONFIG_FILE" 2>/dev/null || true
+        chmod 640 "$CONFIG_FILE" 2>/dev/null || true
         systemctl restart xray; sleep 3
         if systemctl is-active --quiet xray; then
             DETAILS="${DETAILS}
@@ -4539,7 +4557,7 @@ main_menu() {
         6)  show_traffic;;
         7)  troubleshoot;;
         8)  update_xray;;
-        9)  systemctl restart xray; echo -e "${GREEN}已重启${NC}"; systemctl status xray --no-pager;;
+        9)  if restart_with_rollback; then echo -e "${GREEN}已重启${NC}"; fi; systemctl status xray --no-pager;;
         10) monitor_menu;;
         11) uninstall;;
         12) add_direct_node;;
