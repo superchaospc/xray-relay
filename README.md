@@ -36,6 +36,21 @@ VPS 上一键部署 **Xray VLESS + REALITY** 的 Bash 脚本。既支持 **VPS �
 
 ---
 
+## 🆕 v2.2.24 重启前权限自愈
+
+内容正常、只是 `config.json` 属组坏了（`root:root`，多为老版本部署或外部改动遗留）的机器，**只靠一次重启就起不来**——Xray 服务以非 root 用户运行，读不到 `640` 的 config，报 `open config.json: permission denied`。三条重启路径里原本只有「重启失败后回滚」那条会修权限，而最常见的「手动重启 / 监控自动拉起」走的是裸 `systemctl restart xray`，不会自愈。
+
+本版本把权限归一化提前到**每次重启之前**：
+
+- `restart_with_rollback` 重启前无条件 `apply_config_permissions`，把 `config.json` 归一化为 `root:<xray 服务用户主组> 640`（自动探测服务组，不写死 `nogroup`）。
+- 交互菜单 **9) 重启** 改走 `restart_with_rollback`（自愈 + 失败回滚兜底），不再裸重启。
+- 监控自动重启脚本在自动拉起前先修正 `config.json` 属组。
+- 新增 `test_restart_selfheal_permissions.sh`：坏权限（600）的健康 config 仅一次重启即自愈为 640、不触发回滚。
+
+> 受影响的机器**重跑一次脚本或做任意一次重启操作即可自愈**，无需手动 `chown`。
+
+---
+
 ## 🆕 v2.2.23 协议混用提示
 
 本脚本是 **Vision (tcp + xtls-rprx-vision)** 版。如果同一台机器先后被本脚本和 [XHTTP 版脚本](https://github.com/superchaospc/xray-xhttp-relay) 都操作过，配置里就会混入 `network: xhttp` 的线路——而本脚本的链接/订阅生成只会按 Vision 格式输出 `type=tcp`，导致那些 xhttp 线路的分享链接错误、客户端连不上。
